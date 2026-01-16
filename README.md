@@ -22,6 +22,8 @@ improvements over CPU implementations. It can be used with a simple binary (FFVs
 
 There are precompiled binaries ready to be used in the release section.
 
+For a Vulkan and Rust rewrite plan, see [Vulkan + Rust Rewrite Plan](./doc/VulkanRewrite.md).
+
 ## Projects Featuring Vship
 
 If you want to use Vship with a pre-defined workflow, here are some projects
