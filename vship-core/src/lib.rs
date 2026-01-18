@@ -7,6 +7,7 @@ pub mod pipeline;
 pub mod buffer;
 pub mod shader;
 pub mod shader_manager;
+pub mod compute;
 pub mod error;
 pub mod color;
 
@@ -16,6 +17,7 @@ pub use pipeline::{ComputePipeline, PipelineBuilder};
 pub use buffer::{Buffer, BufferView};
 pub use shader::ShaderModule;
 pub use shader_manager::ShaderManager;
+pub use compute::{ComputeContext, compute_dispatch_size};
 pub use error::{VshipError, Result};
 
 use ash::vk;

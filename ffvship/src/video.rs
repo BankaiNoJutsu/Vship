@@ -4,13 +4,22 @@ use anyhow::{Result, Context};
 use vship_metrics::{ImageData, ImageFormat};
 use std::path::Path;
 
-/// Video reader using FFmpeg
+#[cfg(feature = "ffmpeg")]
+use crate::ffmpeg_decoder::FfmpegDecoder;
+
+/// Video reader wrapper
 pub struct VideoReader {
+    #[cfg(feature = "ffmpeg")]
+    decoder: FfmpegDecoder,
+
+    #[cfg(not(feature = "ffmpeg"))]
     width: u32,
+    #[cfg(not(feature = "ffmpeg"))]
     height: u32,
+    #[cfg(not(feature = "ffmpeg"))]
     frame_count: usize,
+    #[cfg(not(feature = "ffmpeg"))]
     fps: f64,
-    // TODO: Add ffmpeg-next decoder fields when implementing
 }
 
 impl VideoReader {
@@ -18,57 +27,91 @@ impl VideoReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
-        // TODO: Implement actual FFmpeg video reading using ffmpeg-next crate
-        // For now, return a placeholder
+        #[cfg(feature = "ffmpeg")]
+        {
+            let decoder = FfmpegDecoder::open(path)?;
+            Ok(Self { decoder })
+        }
 
-        log::warn!("FFmpeg integration not yet implemented, using placeholder");
-        log::info!("Would open video file: {:?}", path);
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            log::warn!("FFmpeg integration not enabled, using placeholder");
+            log::info!("Video file: {:?}", path);
+            log::info!("To enable FFmpeg, see ffvship/src/ffmpeg_decoder.rs");
 
-        // Placeholder values
-        Ok(Self {
-            width: 1920,
-            height: 1080,
-            frame_count: 0,
-            fps: 24.0,
-        })
+            Ok(Self {
+                width: 1920,
+                height: 1080,
+                frame_count: 100,
+                fps: 24.0,
+            })
+        }
     }
 
     /// Get video width
     pub fn width(&self) -> u32 {
-        self.width
+        #[cfg(feature = "ffmpeg")]
+        { self.decoder.width() }
+
+        #[cfg(not(feature = "ffmpeg"))]
+        { self.width }
     }
 
     /// Get video height
     pub fn height(&self) -> u32 {
-        self.height
+        #[cfg(feature = "ffmpeg")]
+        { self.decoder.height() }
+
+        #[cfg(not(feature = "ffmpeg"))]
+        { self.height }
     }
 
     /// Get total frame count
     pub fn frame_count(&self) -> usize {
-        self.frame_count
+        #[cfg(feature = "ffmpeg")]
+        { self.decoder.frame_count() }
+
+        #[cfg(not(feature = "ffmpeg"))]
+        { self.frame_count }
     }
 
     /// Get frames per second
     pub fn fps(&self) -> f64 {
-        self.fps
+        #[cfg(feature = "ffmpeg")]
+        { self.decoder.fps() }
+
+        #[cfg(not(feature = "ffmpeg"))]
+        { self.fps }
     }
 
     /// Read a specific frame
     pub fn read_frame(&mut self, frame_num: usize) -> Result<ImageData> {
-        if frame_num >= self.frame_count {
-            anyhow::bail!("Frame number {} out of range (total: {})", frame_num, self.frame_count);
+        #[cfg(feature = "ffmpeg")]
+        {
+            self.decoder.read_frame(frame_num)
         }
 
-        // TODO: Implement actual frame reading
-        // For now, return a black frame
-
-        Ok(ImageData::new(self.width, self.height, ImageFormat::RGB))
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            if frame_num >= self.frame_count {
+                anyhow::bail!("Frame {} out of range (total: {})", frame_num, self.frame_count);
+            }
+            // Return placeholder black frame
+            Ok(ImageData::new(self.width, self.height, ImageFormat::RGB))
+        }
     }
 
     /// Read next frame in sequence
     pub fn read_next_frame(&mut self) -> Result<Option<ImageData>> {
-        // TODO: Implement sequential frame reading
-        Ok(None)
+        #[cfg(feature = "ffmpeg")]
+        {
+            self.decoder.read_next_frame()
+        }
+
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            Ok(None)
+        }
     }
 }
 

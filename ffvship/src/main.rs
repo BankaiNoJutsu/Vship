@@ -2,6 +2,8 @@
 // Supports SSIMULACRA2, Butteraugli, and CVVDP metrics
 
 mod video;
+#[cfg(feature = "ffmpeg")]
+mod ffmpeg_decoder;
 
 use clap::{Parser, ValueEnum};
 use anyhow::{Result, Context};
