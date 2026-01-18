@@ -1,0 +1,104 @@
+// Vship Core - Vulkan compute abstraction layer
+// Provides GPU device management, memory allocation, and compute pipeline execution
+
+pub mod device;
+pub mod memory;
+pub mod pipeline;
+pub mod buffer;
+pub mod shader;
+pub mod error;
+pub mod color;
+
+pub use device::{VulkanDevice, DeviceSelector};
+pub use memory::{BufferAllocator, BufferUsage};
+pub use pipeline::{ComputePipeline, PipelineBuilder};
+pub use buffer::{Buffer, BufferView};
+pub use shader::ShaderModule;
+pub use error::{VshipError, Result};
+
+use ash::vk;
+use std::sync::Arc;
+
+/// Vship context managing Vulkan instance and devices
+pub struct VshipContext {
+    entry: ash::Entry,
+    instance: ash::Instance,
+    devices: Vec<Arc<VulkanDevice>>,
+}
+
+impl VshipContext {
+    /// Create a new Vship context with automatic device detection
+    pub fn new() -> Result<Self> {
+        let entry = unsafe { ash::Entry::load()? };
+
+        // Create Vulkan instance
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"Vship")
+            .application_version(vk::make_api_version(0, 4, 1, 0))
+            .engine_name(c"Vship")
+            .engine_version(vk::make_api_version(0, 4, 1, 0))
+            .api_version(vk::API_VERSION_1_3);
+
+        let create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info);
+
+        let instance = unsafe { entry.create_instance(&create_info, None)? };
+
+        // Enumerate and create devices
+        let physical_devices = unsafe { instance.enumerate_physical_devices()? };
+        let mut devices = Vec::new();
+
+        for physical_device in physical_devices {
+            match VulkanDevice::new(&instance, physical_device) {
+                Ok(device) => devices.push(Arc::new(device)),
+                Err(e) => log::warn!("Failed to create device: {}", e),
+            }
+        }
+
+        if devices.is_empty() {
+            return Err(VshipError::NoDeviceFound);
+        }
+
+        log::info!("Initialized Vship with {} device(s)", devices.len());
+
+        Ok(Self {
+            entry,
+            instance,
+            devices,
+        })
+    }
+
+    /// Get all available devices
+    pub fn devices(&self) -> &[Arc<VulkanDevice>] {
+        &self.devices
+    }
+
+    /// Get the default (first) device
+    pub fn default_device(&self) -> Arc<VulkanDevice> {
+        Arc::clone(&self.devices[0])
+    }
+
+    /// Select a device by index
+    pub fn device(&self, index: usize) -> Option<Arc<VulkanDevice>> {
+        self.devices.get(index).map(Arc::clone)
+    }
+}
+
+impl Drop for VshipContext {
+    fn drop(&mut self) {
+        unsafe {
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_context_creation() {
+        let ctx = VshipContext::new().expect("Failed to create context");
+        assert!(!ctx.devices().is_empty());
+    }
+}

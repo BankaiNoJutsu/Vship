@@ -41,3 +41,19 @@ test.cpp
 *.out
 *.app
 FFVship
+
+# Rust / Cargo
+/target/
+**/target/
+Cargo.lock
+
+# Generated C header from cbindgen
+/include/vship.h
+
+# Rust debug/release builds
+debug/
+release/
+
+# Profiling
+*.profdata
+*.profraw

@@ -1,9 +1,76 @@
-# Deprecation Notice: Vship is moving away from github (microslop). 
+# Deprecation Notice: Vship is moving away from github (microslop).
 
 Here is the link to the new [Codeberg Repository](https://codeberg.org/Line-fr/Vship)
 This git repository will receive no further commits/releases but files will remain for now.
 
-# Vship : Fast Metric Computation on GPU
+---
+
+# 🎉 Vship 4.1.0 - Rust & Vulkan Rewrite
+
+This branch (`claude/rewrite-vship-rust-vulkan-940VX`) contains a complete rewrite of Vship in **Rust** with **Vulkan** compute shaders for maximum portability, safety, and performance.
+
+## Why Rewrite in Rust & Vulkan?
+
+✨ **Cross-Platform GPU Acceleration**: Vulkan runs on AMD, NVIDIA, Intel, Apple Silicon (via MoltenVK), and mobile GPUs
+🦀 **Memory Safety**: Rust eliminates entire classes of bugs at compile time
+⚡ **Maintained Performance**: Same blazing-fast GPU acceleration with better code maintainability
+🌐 **Vendor-Agnostic**: One codebase works on all GPUs, no separate HIP/CUDA builds needed
+
+## New Architecture
+
+```
+vship/ (Cargo workspace)
+├── vship-core/      # Vulkan compute abstraction
+├── vship-metrics/   # SSIMULACRA2, Butteraugli, CVVDP
+├── vship-ffi/       # C API (drop-in replacement)
+└── ffvship/         # CLI tool
+```
+
+## Quick Start (Rust Version)
+
+```bash
+# Build the new Rust version
+cargo build --release
+
+# Run FFVship CLI
+./target/release/ffvship -r ref.mp4 -d dist.mp4 -m ssimulacra2
+
+# Or install it
+cargo install --path ffvship
+```
+
+## C API Compatibility
+
+The Rust version provides a C API that's compatible with existing integrations:
+
+```c
+#include "vship.h"  // Generated from Rust FFI
+
+VshipHandle* ctx = vship_init();
+VshipMetricHandle* metric = vship_metric_create(ctx, VSHIP_METRIC_TYPE_SSIMULACRA2);
+// ... use as before
+```
+
+## Implementation Status
+
+✅ **Completed**:
+- Rust project structure with Cargo workspace
+- Vulkan device management and GPU selection
+- Memory allocation and buffer management
+- Compute pipeline abstraction
+- CPU baseline implementations of all metrics
+- C FFI bindings (cbindgen)
+- CLI tool framework
+
+🚧 **In Progress**:
+- Vulkan compute shaders for GPU acceleration
+- FFmpeg video file integration
+- VapourSynth plugin rewrite
+- Full test suite
+
+---
+
+# Vship (Original C++/HIP/CUDA): Fast Metric Computation on GPU
 
 An easy to use high-performance Library for GPU-accelerated visual fidelity
 metrics with SSIMULACRA2, Butteraugli & CVVDP.

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "vship-core",
+    "vship-metrics",
+    "vship-ffi",
+    "ffvship",
+]
+
+[workspace.package]
+version = "4.1.0"
+edition = "2021"
+authors = ["Vship Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/vship"
+
+[workspace.dependencies]
+# Vulkan bindings - using ash for low-level control similar to HIP/CUDA
+ash = "0.38"
+gpu-allocator = "0.27"
+
+# Math and linear algebra
+glam = "0.29"
+nalgebra = "0.33"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+rayon = "1.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# FFI
+cbindgen = "0.27"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Video processing
+ffmpeg-next = "7.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

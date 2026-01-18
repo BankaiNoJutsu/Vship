@@ -1,0 +1,25 @@
+[package]
+name = "ffvship"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FFVship CLI tool for computing video quality metrics"
+
+[[bin]]
+name = "ffvship"
+path = "src/main.rs"
+
+[dependencies]
+vship-core = { path = "../vship-core" }
+vship-metrics = { path = "../vship-metrics" }
+clap.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+rayon.workspace = true
+ffmpeg-next.workspace = true
+serde.workspace = true
+serde_json.workspace = true

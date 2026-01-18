@@ -1,0 +1,21 @@
+[package]
+name = "vship-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C API bindings for Vship"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+vship-core = { path = "../vship-core" }
+vship-metrics = { path = "../vship-metrics" }
+thiserror.workspace = true
+anyhow.workspace = true
+log.workspace = true
+
+[build-dependencies]
+cbindgen.workspace = true
