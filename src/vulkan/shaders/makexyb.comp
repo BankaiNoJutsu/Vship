@@ -1,0 +1,71 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer P0Buffer {
+    float data[];
+} p0;
+
+layout(binding = 1) buffer P1Buffer {
+    float data[];
+} p1;
+
+layout(binding = 2) buffer P2Buffer {
+    float data[];
+} p2;
+
+layout(push_constant) uniform PushConstants {
+    int64_t width;
+} pc;
+
+// Device functions
+
+void opsin_absorbance(inout vec3 a) {
+    const float opsin_bias = 0.0037930734;
+    vec3 out_val;
+
+    out_val.x = 0.30 * a.x + 0.622 * a.y + 0.078 * a.z + opsin_bias;
+    out_val.y = 0.23 * a.x + 0.692 * a.y + 0.078 * a.z + opsin_bias;
+    out_val.z = 0.24342269 * a.x + 0.20476745 * a.y + 0.55180986 * a.z + opsin_bias;
+
+    a = out_val;
+}
+
+void mixed_to_xyb(inout vec3 a) {
+    a.x = 0.5 * (a.x - a.y);
+    a.y = a.x + a.y;
+}
+
+void linear_rgb_to_xyb(inout vec3 a) {
+    const float abs_bias = -0.1559542025327239;
+    opsin_absorbance(a);
+
+    a.x = sign(a.x) * pow(abs(a.x) * float(a.x >= 0), 1.0/3.0) + abs_bias;
+    a.y = sign(a.y) * pow(abs(a.y) * float(a.y >= 0), 1.0/3.0) + abs_bias;
+    a.z = sign(a.z) * pow(abs(a.z) * float(a.z >= 0), 1.0/3.0) + abs_bias;
+
+    mixed_to_xyb(a);
+}
+
+void make_positive_xyb(inout vec3 a) {
+    a.z = (a.z - a.y) + 0.55;
+    a.x = a.x * 14.0 + 0.42;
+    a.y += 0.01;
+}
+
+void rgb_to_positive_xyb_d(inout vec3 a) {
+    linear_rgb_to_xyb(a);
+    make_positive_xyb(a);
+}
+
+void main() {
+    int64_t x = int64_t(gl_GlobalInvocationID.x);
+    if (x >= pc.width) return;
+
+    vec3 packed = vec3(p0.data[x], p1.data[x], p2.data[x]);
+    rgb_to_positive_xyb_d(packed);
+
+    p0.data[x] = packed.x;
+    p1.data[x] = packed.y;
+    p2.data[x] = packed.z;
+}

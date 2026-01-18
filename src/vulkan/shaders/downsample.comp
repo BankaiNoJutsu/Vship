@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer SrcBuffer {
+    float data[];
+} src;
+
+layout(binding = 1) writeonly buffer DstBuffer {
+    float data[];
+} dst;
+
+layout(push_constant) uniform PushConstants {
+    int64_t width;
+    int64_t height;
+    int64_t neww;
+    int64_t newh;
+} pc;
+
+void main() {
+    int64_t x = int64_t(gl_GlobalInvocationID.x);
+    int64_t y = int64_t(gl_GlobalInvocationID.y);
+
+    int64_t newh = (pc.height - 1) / 2 + 1;
+    int64_t neww = (pc.width - 1) / 2 + 1;
+
+    if (x >= neww || y >= newh) return;
+
+    int64_t width = pc.width;
+    int64_t height = pc.height;
+
+    float value = 0.0;
+    value += src.data[min(2*y, height-1) * width + min(2*x, width-1)];
+    value += src.data[min(2*y + 1, height-1) * width + min(2*x, width-1)];
+    value += src.data[min(2*y, height-1) * width + min(2*x + 1, width-1)];
+    value += src.data[min(2*y + 1, height-1) * width + min(2*x + 1, width-1)];
+    value *= 0.25;
+
+    dst.data[y * neww + x] = value;
+}

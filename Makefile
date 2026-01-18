@@ -48,6 +48,11 @@ buildcudaall: src/VshipLib.cpp .FORCE
 buildall: src/VshipLib.cpp .FORCE
 	hipcc src/VshipLib.cpp -g -std=c++17 -Wall -Wno-ignored-attributes -I "$(current_dir)include" $(fatbincompressamd) --offload-arch=$(HIPARCH) -shared $(fpicamd) -o "$(current_dir)libvship$(dllend)"
 
+buildvulkan: src/VshipLib.cpp src/vulkan/VulkanContext.cpp .FORCE
+	@echo "Building Vship with Vulkan backend..."
+	@bash src/vulkan/shaders/compile_shaders.sh
+	g++ src/VshipLib.cpp src/vulkan/VulkanContext.cpp -g -std=c++17 -Wall -DUSE_VULKAN -I "$(current_dir)include" -I "$(current_dir)src" -lvulkan -shared $(fpicamd) -o "$(current_dir)libvship$(dllend)"
+
 ifeq ($(OS),Windows_NT)
 install:
 	if exist "$(current_dir)libvship$(dllend)" copy "$(current_dir)libvship$(dllend)" "$(plugin_install_path)"

@@ -19,7 +19,11 @@
 #include<algorithm>
 
 
-#if defined __CUDACC__
+#if defined USE_VULKAN
+    // Vulkan backend
+    #include "../vulkan/VulkanPreprocessor.hpp"
+    // hipXXX macros are defined in VulkanPreprocessor.hpp
+#elif defined __CUDACC__
     #include <cuda_fp16.h>
     #define LOWLEVEL
     #define hipMemcpyDtoH(x, y, z) cudaMemcpy(x, y, z, cudaMemcpyDeviceToHost)
@@ -53,7 +57,7 @@
     #define hipEventRecord cudaEventRecord
     #define hipEvent_t cudaEvent_t
     #define hipEventElapsedTime cudaEventElapsedTime
-    #define hipDeviceSetCacheConfig cudaDeviceSetCacheConfig 
+    #define hipDeviceSetCacheConfig cudaDeviceSetCacheConfig
     #define hipFuncCachePreferShared cudaFuncCachePreferShared
     #define hipFuncCachePreferNone cudaFuncCachePreferNone
     #define hipFuncCachePreferL1 cudaFuncCachePreferL1

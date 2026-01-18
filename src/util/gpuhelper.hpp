@@ -4,6 +4,10 @@
 #include "preprocessor.hpp"
 #include "VshipExceptions.hpp"
 
+#ifdef USE_VULKAN
+#include "../vulkan/VulkanHelper.hpp"
+#else
+
 //here is the format of the answer:
 
 //case where gpu_id is not specified:
@@ -81,4 +85,6 @@ namespace helper{
     }
 }
 
-#endif
+#endif // USE_VULKAN
+
+#endif // GPUHELPERHPP
