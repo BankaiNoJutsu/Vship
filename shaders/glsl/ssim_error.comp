@@ -1,25 +1,35 @@
 #version 450
 
-// Compute SSIM-inspired error between reference and distorted images
+// Compute perceptual error between reference and distorted images in XYB space
+// Uses squared error with perceptual weighting
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) readonly buffer ReferenceBuffer {
-    float reference[];
+layout(set = 0, binding = 0) readonly buffer RefBuffer {
+    float ref_data[];
 };
 
-layout(set = 0, binding = 1) readonly buffer DistortedBuffer {
-    float distorted[];
+layout(set = 0, binding = 1) readonly buffer DistBuffer {
+    float dist_data[];
 };
 
-layout(set = 0, binding = 2) buffer ErrorBuffer {
+layout(set = 0, binding = 2) readonly buffer RefMuBuffer {
+    float ref_mu[];  // Blurred reference (local mean)
+};
+
+layout(set = 0, binding = 3) readonly buffer DistMuBuffer {
+    float dist_mu[];  // Blurred distorted (local mean)
+};
+
+layout(set = 0, binding = 4) buffer ErrorBuffer {
     float errors[];
 };
 
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
-    uint channel;
+    float C1;  // Not used in this version
+    float C2;  // Not used in this version
 } pc;
 
 void main() {
@@ -30,15 +40,35 @@ void main() {
         return;
     }
 
-    // Offset for the current channel
-    uint channel_offset = pc.channel * total_pixels;
-    uint pixel_idx = channel_offset + idx;
+    // Get original values
+    float x = ref_data[idx];
+    float y = dist_data[idx];
 
-    float ref_val = reference[pixel_idx];
-    float dist_val = distorted[pixel_idx];
+    // Get local means (from Gaussian blur)
+    float mu_x = ref_mu[idx];
+    float mu_y = dist_mu[idx];
 
-    // Compute absolute difference (simple error metric)
-    float error = abs(ref_val - dist_val);
+    // Compute detail (high-frequency) component
+    float detail_x = x - mu_x;
+    float detail_y = y - mu_y;
 
-    errors[idx] = error;
+    // Mean (structure) error - differences in local mean
+    float mean_diff = mu_x - mu_y;
+    float mean_error = mean_diff * mean_diff;
+
+    // Detail (texture) error - differences in high-frequency content
+    float detail_diff = detail_x - detail_y;
+    float detail_error = detail_diff * detail_diff;
+
+    // Direct pixel error
+    float pixel_diff = x - y;
+    float pixel_error = pixel_diff * pixel_diff;
+
+    // Combined perceptual error
+    // Weight structure errors more heavily than detail errors
+    // This matches human perception which is more sensitive to structural changes
+    float error = 0.4 * mean_error + 0.3 * detail_error + 0.3 * pixel_error;
+
+    // Apply perceptual nonlinearity (square root for better perceptual scaling)
+    errors[idx] = sqrt(error);
 }

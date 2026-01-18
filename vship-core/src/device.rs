@@ -3,8 +3,60 @@ use ash::vk;
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex};
 
+/// Vulkan instance wrapper with reference-counted lifetime
+///
+/// This ensures the Vulkan instance is only destroyed after all devices
+/// that depend on it have been dropped.
+pub struct VulkanInstance {
+    #[allow(dead_code)]
+    entry: ash::Entry,
+    instance: ash::Instance,
+}
+
+impl VulkanInstance {
+    /// Create a new Vulkan instance
+    pub fn new() -> Result<Self> {
+        let entry = unsafe { ash::Entry::load()? };
+
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"Vship")
+            .application_version(vk::make_api_version(0, 4, 1, 0))
+            .engine_name(c"Vship")
+            .engine_version(vk::make_api_version(0, 4, 1, 0))
+            .api_version(vk::API_VERSION_1_3);
+
+        let create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info);
+
+        let instance = unsafe { entry.create_instance(&create_info, None)? };
+
+        Ok(Self { entry, instance })
+    }
+
+    /// Get the raw Vulkan instance
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance
+    }
+
+    /// Enumerate physical devices
+    pub fn enumerate_physical_devices(&self) -> Result<Vec<vk::PhysicalDevice>> {
+        let devices = unsafe { self.instance.enumerate_physical_devices()? };
+        Ok(devices)
+    }
+}
+
+impl Drop for VulkanInstance {
+    fn drop(&mut self) {
+        unsafe {
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
 /// Vulkan device wrapper with compute queue support
 pub struct VulkanDevice {
+    // Hold a reference to the instance to keep it alive
+    _instance: Arc<VulkanInstance>,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     compute_queue_family: u32,
@@ -16,7 +68,8 @@ pub struct VulkanDevice {
 
 impl VulkanDevice {
     /// Create a new Vulkan device from a physical device
-    pub fn new(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Result<Self> {
+    pub fn new(vulkan_instance: Arc<VulkanInstance>, physical_device: vk::PhysicalDevice) -> Result<Self> {
+        let instance = vulkan_instance.instance();
         let properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let memory_properties = unsafe {
             instance.get_physical_device_memory_properties(physical_device)
@@ -65,6 +118,7 @@ impl VulkanDevice {
         );
 
         Ok(Self {
+            _instance: vulkan_instance,
             physical_device,
             device,
             compute_queue_family,

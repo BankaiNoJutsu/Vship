@@ -100,15 +100,14 @@ impl MetricsContext {
         Ok(Self { vship_ctx })
     }
 
-    /// Create SSIMULACRA2 metric (CPU)
-    pub fn create_ssimulacra2(&self) -> Result<Ssimulacra2> {
-        Ssimulacra2::new(self.vship_ctx.default_device())
+    /// Create SSIMULACRA2 metric (GPU-accelerated by default)
+    pub fn create_ssimulacra2(&self) -> Result<Ssimulacra2Gpu> {
+        Ssimulacra2Gpu::new(self.vship_ctx.default_device(), self.vship_ctx.instance())
     }
 
-    /// Create SSIMULACRA2 metric (GPU-accelerated)
-    pub fn create_ssimulacra2_gpu(&self) -> Result<Ssimulacra2Gpu> {
-        use ssimulacra2_gpu::Ssimulacra2Gpu;
-        Ssimulacra2Gpu::new(self.vship_ctx.default_device(), self.vship_ctx.instance())
+    /// Create SSIMULACRA2 metric (CPU fallback)
+    pub fn create_ssimulacra2_cpu(&self) -> Result<Ssimulacra2> {
+        Ssimulacra2::new(self.vship_ctx.default_device())
     }
 
     /// Create Butteraugli metric

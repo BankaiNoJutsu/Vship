@@ -1,26 +1,21 @@
 // FFmpeg video decoder implementation
-// Note: This is a placeholder showing the intended structure
-// Full ffmpeg-next integration requires the FFmpeg libraries to be installed
 
 use anyhow::{Result, Context};
 use vship_metrics::{ImageData, ImageFormat};
 use std::path::Path;
 
-/// FFmpeg-based video decoder
-///
-/// This implementation provides a structure for FFmpeg integration.
-/// To fully enable, install FFmpeg development libraries and uncomment
-/// the ffmpeg-next dependency in Cargo.toml.
+/// FFmpeg-based video decoder with streaming support
 pub struct FfmpegDecoder {
     width: u32,
     height: u32,
     frame_count: usize,
     fps: f64,
+    input_path: std::path::PathBuf,
+    // Streaming state
     current_frame: usize,
-    // TODO: Add ffmpeg-next decoder fields
-    // input_context: ffmpeg::format::context::Input,
-    // video_stream_index: usize,
-    // decoder: ffmpeg::decoder::Video,
+    input: Option<ffmpeg_next::format::context::Input>,
+    decoder: Option<ffmpeg_next::decoder::Video>,
+    video_stream_index: usize,
 }
 
 impl FfmpegDecoder {
@@ -28,60 +23,134 @@ impl FfmpegDecoder {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
-        log::info!("Opening video file: {:?}", path);
+        // Initialize FFmpeg (idempotent)
+        ffmpeg_next::init()
+            .context("Failed to initialize FFmpeg")?;
 
-        // TODO: Full FFmpeg implementation
-        // This is a placeholder showing the intended API
-
-        /*
-        // Initialize FFmpeg
-        ffmpeg::init()?;
-
-        // Open input
-        let input_context = ffmpeg::format::input(&path)
+        // Open input file to get metadata
+        let input = ffmpeg_next::format::input(&path)
             .context("Failed to open video file")?;
 
-        // Find video stream
-        let input = input_context.streams().best(ffmpeg::media::Type::Video)
-            .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
-        let video_stream_index = input.index();
+        // Find the video stream
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .context("No video stream found in file")?;
 
-        // Create decoder
-        let decoder_context = ffmpeg::codec::context::Context::from_parameters(input.parameters())?;
-        let mut decoder = decoder_context.decoder().video()?;
+        let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .context("Failed to create codec context")?;
+
+        let decoder = context_decoder
+            .decoder()
+            .video()
+            .context("Failed to create video decoder")?;
 
         let width = decoder.width();
         let height = decoder.height();
-        let fps = input.avg_frame_rate();
-        let frame_count = input.frames() as usize;
 
-        log::info!("Video: {}x{} @ {:.2} fps ({} frames)",
+        // Get frame rate
+        let avg_frame_rate = stream.avg_frame_rate();
+        let fps = avg_frame_rate.numerator() as f64 / avg_frame_rate.denominator() as f64;
+
+        // Estimate frame count from duration and fps
+        let duration_secs = input.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE);
+        let frame_count = (duration_secs * fps) as usize;
+
+        log::info!("Opened video: {}x{} @ {:.2} fps (~{} frames)",
                    width, height, fps, frame_count);
 
         Ok(Self {
             width,
             height,
             frame_count,
-            fps: fps.into(),
+            fps,
+            input_path: path.to_path_buf(),
             current_frame: 0,
-            input_context,
-            video_stream_index,
-            decoder,
+            input: None,
+            decoder: None,
+            video_stream_index: 0,
         })
-        */
+    }
 
-        // Placeholder implementation
-        log::warn!("FFmpeg integration not yet enabled");
-        log::warn!("To enable: Install FFmpeg dev libraries and uncomment ffmpeg-next dependency");
-        log::warn!("Using placeholder video metadata");
+    /// Initialize streaming decoder (call before streaming frames)
+    pub fn init_streaming(&mut self) -> Result<()> {
+        if self.input.is_some() {
+            return Ok(()); // Already initialized
+        }
 
-        Ok(Self {
-            width: 1920,
-            height: 1080,
-            frame_count: 100,
-            fps: 24.0,
-            current_frame: 0,
-        })
+        let input = ffmpeg_next::format::input(&self.input_path)
+            .context("Failed to open video file for streaming")?;
+
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .context("No video stream found")?;
+
+        self.video_stream_index = stream.index();
+
+        let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .context("Failed to create codec context")?;
+
+        let decoder = context_decoder
+            .decoder()
+            .video()
+            .context("Failed to create video decoder")?;
+
+        self.input = Some(input);
+        self.decoder = Some(decoder);
+        self.current_frame = 0;
+
+        Ok(())
+    }
+
+    /// Decode the next frame in sequence (streaming mode)
+    pub fn decode_next_frame(&mut self) -> Result<Option<ImageData>> {
+        self.init_streaming()?;
+
+        let input = self.input.as_mut().unwrap();
+        let decoder = self.decoder.as_mut().unwrap();
+        let pixel_count = (self.width * self.height) as usize;
+
+        // Try to get a frame from already-sent packets
+        let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
+        if decoder.receive_frame(&mut decoded_frame).is_ok() {
+            self.current_frame += 1;
+            return Ok(Some(self.convert_frame_to_image(&decoded_frame, pixel_count)?));
+        }
+
+        // Need to send more packets
+        for (stream, packet) in input.packets() {
+            if stream.index() == self.video_stream_index {
+                decoder.send_packet(&packet)
+                    .context("Failed to send packet to decoder")?;
+
+                if decoder.receive_frame(&mut decoded_frame).is_ok() {
+                    self.current_frame += 1;
+                    return Ok(Some(self.convert_frame_to_image(&decoded_frame, pixel_count)?));
+                }
+            }
+        }
+
+        // Flush decoder
+        decoder.send_eof().ok();
+        if decoder.receive_frame(&mut decoded_frame).is_ok() {
+            self.current_frame += 1;
+            return Ok(Some(self.convert_frame_to_image(&decoded_frame, pixel_count)?));
+        }
+
+        Ok(None) // End of video
+    }
+
+    /// Get current frame position in streaming mode
+    pub fn current_frame_position(&self) -> usize {
+        self.current_frame
+    }
+
+    /// Reset streaming to beginning
+    pub fn reset_streaming(&mut self) {
+        self.input = None;
+        self.decoder = None;
+        self.current_frame = 0;
     }
 
     /// Get video width
@@ -104,97 +173,133 @@ impl FfmpegDecoder {
         self.fps
     }
 
-    /// Read a specific frame
-    pub fn read_frame(&mut self, frame_num: usize) -> Result<ImageData> {
-        if frame_num >= self.frame_count {
-            anyhow::bail!("Frame {} out of range (total: {})", frame_num, self.frame_count);
-        }
+    /// Decode a range of frames (start..end)
+    /// Much more memory-efficient than decoding all frames
+    pub fn decode_frame_range(&self, start: usize, end: usize) -> Result<Vec<ImageData>> {
+        let actual_end = end.min(self.frame_count);
+        let num_frames = actual_end.saturating_sub(start);
 
-        // TODO: Full FFmpeg decoding implementation
-        /*
-        // Seek to frame if needed
-        if frame_num != self.current_frame {
-            let timestamp = (frame_num as f64 / self.fps * 1000.0) as i64;
-            self.input_context.seek(timestamp, ..timestamp)?;
-            self.decoder.flush();
-        }
+        log::info!("Decoding frames {} to {} ({} frames)...", start, actual_end, num_frames);
 
-        // Decode frame
-        for (stream, packet) in self.input_context.packets() {
-            if stream.index() == self.video_stream_index {
-                self.decoder.send_packet(&packet)?;
+        let mut input = ffmpeg_next::format::input(&self.input_path)
+            .context("Failed to open video file")?;
 
-                let mut frame = ffmpeg::util::frame::Video::empty();
-                if self.decoder.receive_frame(&mut frame).is_ok() {
-                    // Convert to RGB
-                    let mut scaler = ffmpeg::software::scaling::Context::get(
-                        frame.format(),
-                        frame.width(),
-                        frame.height(),
-                        ffmpeg::format::Pixel::RGB24,
-                        frame.width(),
-                        frame.height(),
-                        ffmpeg::software::scaling::Flags::BILINEAR,
-                    )?;
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .context("No video stream found")?;
 
-                    let mut rgb_frame = ffmpeg::util::frame::Video::empty();
-                    scaler.run(&frame, &mut rgb_frame)?;
+        let video_stream_index = stream.index();
 
-                    // Convert to ImageData
-                    let mut image = ImageData::new(self.width, self.height, ImageFormat::RGB);
+        let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .context("Failed to create codec context")?;
 
-                    // Copy planar RGB data
-                    let data = rgb_frame.data(0);
-                    let stride = rgb_frame.stride(0);
+        let mut decoder = context_decoder
+            .decoder()
+            .video()
+            .context("Failed to create video decoder")?;
 
-                    for y in 0..self.height {
-                        for x in 0..self.width {
-                            let src_idx = (y * stride as u32 + x * 3) as usize;
-                            let dst_idx = (y * self.width + x) as usize;
-                            let pixel_count = (self.width * self.height) as usize;
+        let pixel_count = (self.width * self.height) as usize;
+        let mut frames = Vec::new();
+        frames.reserve(num_frames);
 
-                            image.data[dst_idx] = data[src_idx] as f32 / 255.0;  // R
-                            image.data[pixel_count + dst_idx] = data[src_idx + 1] as f32 / 255.0;  // G
-                            image.data[2 * pixel_count + dst_idx] = data[src_idx + 2] as f32 / 255.0;  // B
+        let mut current_frame_idx = 0;
+
+        // Process packets
+        for (stream, packet) in input.packets() {
+            if stream.index() == video_stream_index {
+                decoder.send_packet(&packet)
+                    .context("Failed to send packet to decoder")?;
+
+                let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
+
+                while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                    // Only keep frames in the requested range
+                    if current_frame_idx >= start && current_frame_idx < actual_end {
+                        let image = self.convert_frame_to_image(&decoded_frame, pixel_count)?;
+                        frames.push(image);
+
+                        if frames.len() % 50 == 0 {
+                            log::info!("Decoded {} / {} frames...", frames.len(), num_frames);
                         }
                     }
 
-                    self.current_frame = frame_num + 1;
-                    return Ok(image);
+                    current_frame_idx += 1;
+
+                    // Stop if we've decoded all frames we need
+                    if current_frame_idx >= actual_end {
+                        log::info!("Decoded {} total frames", frames.len());
+                        return Ok(frames);
+                    }
                 }
             }
         }
 
-        anyhow::bail!("Failed to decode frame {}", frame_num);
-        */
+        // Flush decoder
+        decoder.send_eof().ok();
+        let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
+        while decoder.receive_frame(&mut decoded_frame).is_ok() {
+            if current_frame_idx >= start && current_frame_idx < actual_end {
+                let image = self.convert_frame_to_image(&decoded_frame, pixel_count)?;
+                frames.push(image);
+            }
+            current_frame_idx += 1;
 
-        // Placeholder: Return black frame
-        log::debug!("Returning placeholder frame {}", frame_num);
-        Ok(ImageData::new(self.width, self.height, ImageFormat::RGB))
-    }
-
-    /// Read next frame in sequence
-    pub fn read_next_frame(&mut self) -> Result<Option<ImageData>> {
-        if self.current_frame >= self.frame_count {
-            return Ok(None);
+            if current_frame_idx >= actual_end {
+                break;
+            }
         }
 
-        let frame = self.read_frame(self.current_frame)?;
-        self.current_frame += 1;
-        Ok(Some(frame))
+        log::info!("Decoded {} total frames", frames.len());
+        Ok(frames)
+    }
+
+    /// Convert an FFmpeg frame to ImageData
+    fn convert_frame_to_image(&self, frame: &ffmpeg_next::util::frame::Video, pixel_count: usize) -> Result<ImageData> {
+        // Convert frame to RGB using swscale
+        let mut scaler = ffmpeg_next::software::scaling::Context::get(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            ffmpeg_next::util::format::Pixel::RGB24,
+            self.width,
+            self.height,
+            ffmpeg_next::software::scaling::Flags::BILINEAR,
+        ).context("Failed to create scaler")?;
+
+        let mut rgb_frame = ffmpeg_next::util::frame::Video::empty();
+        scaler.run(frame, &mut rgb_frame)
+            .context("Failed to scale frame")?;
+
+        // Convert to ImageData format (planar RGB, values 0.0-1.0)
+        let mut image = ImageData::new(self.width, self.height, ImageFormat::RGB);
+
+        // RGB24 is packed format: RGBRGBRGB...
+        let data = rgb_frame.data(0);
+        let stride = rgb_frame.stride(0) as usize;
+
+        for y in 0..self.height as usize {
+            for x in 0..self.width as usize {
+                let src_idx = y * stride + x * 3;
+                let dst_idx = y * self.width as usize + x;
+
+                // Convert from [0, 255] to [0.0, 1.0] and store in planar format
+                image.data[dst_idx] = data[src_idx] as f32 / 255.0;  // R
+                image.data[pixel_count + dst_idx] = data[src_idx + 1] as f32 / 255.0;  // G
+                image.data[2 * pixel_count + dst_idx] = data[src_idx + 2] as f32 / 255.0;  // B
+            }
+        }
+
+        Ok(image)
     }
 }
 
 /// FFmpeg initialization
 pub fn init_ffmpeg() -> Result<()> {
-    // TODO: Call ffmpeg::init() when enabled
-    log::info!("FFmpeg support: DISABLED (placeholder mode)");
-    log::info!("To enable FFmpeg:");
-    log::info!("  1. Install FFmpeg development libraries:");
-    log::info!("     - Ubuntu/Debian: sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev");
-    log::info!("     - macOS: brew install ffmpeg");
-    log::info!("     - Windows: Download from ffmpeg.org");
-    log::info!("  2. Uncomment 'ffmpeg-next' dependency in ffvship/Cargo.toml");
-    log::info!("  3. Rebuild: cargo build --release");
+    ffmpeg_next::init()
+        .context("Failed to initialize FFmpeg")?;
+
+    log::info!("FFmpeg initialized successfully");
+
     Ok(())
 }

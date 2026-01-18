@@ -165,20 +165,22 @@ impl PipelineBuilder {
                 .map_err(|(_, e)| e)?[0]
         };
 
-        // Create descriptor pool
+        // Create descriptor pool with enough capacity for frame processing
+        // We need many sets per frame: ~100 for all scales and channels
         let pool_sizes = self
             .descriptor_bindings
             .iter()
             .map(|binding| {
                 vk::DescriptorPoolSize::default()
                     .ty(binding.descriptor_type)
-                    .descriptor_count(16) // Support up to 16 descriptor sets
+                    .descriptor_count(256) // Support many descriptor sets per frame
             })
             .collect::<Vec<_>>();
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(16)
-            .pool_sizes(&pool_sizes);
+            .max_sets(256)
+            .pool_sizes(&pool_sizes)
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
 
         let descriptor_pool = unsafe { device.device().create_descriptor_pool(&pool_info, None)? };
 
@@ -229,6 +231,17 @@ impl ComputePipeline {
         let descriptor_sets = unsafe { self.device.device().allocate_descriptor_sets(&alloc_info)? };
 
         Ok(descriptor_sets[0])
+    }
+
+    /// Reset the descriptor pool, freeing all allocated sets
+    /// Call this between frames to reuse the pool
+    pub fn reset_descriptor_pool(&self) -> Result<()> {
+        unsafe {
+            self.device
+                .device()
+                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())?;
+        }
+        Ok(())
     }
 
     /// Update descriptor set with buffer bindings

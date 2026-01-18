@@ -11,7 +11,7 @@ pub mod compute;
 pub mod error;
 pub mod color;
 
-pub use device::{VulkanDevice, DeviceSelector};
+pub use device::{VulkanDevice, DeviceSelector, VulkanInstance};
 pub use memory::{BufferAllocator, BufferUsage, AllocatedBuffer};
 pub use pipeline::{ComputePipeline, PipelineBuilder};
 pub use buffer::{Buffer, BufferView};
@@ -20,40 +20,26 @@ pub use shader_manager::ShaderManager;
 pub use compute::{ComputeContext, compute_dispatch_size};
 pub use error::{VshipError, Result};
 
-use ash::vk;
 use std::sync::Arc;
 
 /// Vship context managing Vulkan instance and devices
 pub struct VshipContext {
-    entry: ash::Entry,
-    instance: ash::Instance,
+    instance: Arc<VulkanInstance>,
     devices: Vec<Arc<VulkanDevice>>,
 }
 
 impl VshipContext {
     /// Create a new Vship context with automatic device detection
     pub fn new() -> Result<Self> {
-        let entry = unsafe { ash::Entry::load()? };
-
-        // Create Vulkan instance
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(c"Vship")
-            .application_version(vk::make_api_version(0, 4, 1, 0))
-            .engine_name(c"Vship")
-            .engine_version(vk::make_api_version(0, 4, 1, 0))
-            .api_version(vk::API_VERSION_1_3);
-
-        let create_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info);
-
-        let instance = unsafe { entry.create_instance(&create_info, None)? };
+        // Create Vulkan instance (reference-counted)
+        let instance = Arc::new(VulkanInstance::new()?);
 
         // Enumerate and create devices
-        let physical_devices = unsafe { instance.enumerate_physical_devices()? };
+        let physical_devices = instance.enumerate_physical_devices()?;
         let mut devices = Vec::new();
 
         for physical_device in physical_devices {
-            match VulkanDevice::new(&instance, physical_device) {
+            match VulkanDevice::new(Arc::clone(&instance), physical_device) {
                 Ok(device) => devices.push(Arc::new(device)),
                 Err(e) => log::warn!("Failed to create device: {}", e),
             }
@@ -66,7 +52,6 @@ impl VshipContext {
         log::info!("Initialized Vship with {} device(s)", devices.len());
 
         Ok(Self {
-            entry,
             instance,
             devices,
         })
@@ -74,7 +59,7 @@ impl VshipContext {
 
     /// Get the Vulkan instance
     pub fn instance(&self) -> &ash::Instance {
-        &self.instance
+        self.instance.instance()
     }
 
     /// Get all available devices
@@ -93,13 +78,10 @@ impl VshipContext {
     }
 }
 
-impl Drop for VshipContext {
-    fn drop(&mut self) {
-        unsafe {
-            self.instance.destroy_instance(None);
-        }
-    }
-}
+// Note: VshipContext no longer needs a Drop impl because the instance
+// is reference-counted via Arc<VulkanInstance>. The instance will only
+// be destroyed when all devices (which also hold Arc<VulkanInstance>)
+// have been dropped first, ensuring correct Vulkan destruction order.
 
 #[cfg(test)]
 mod tests {

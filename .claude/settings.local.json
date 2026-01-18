@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tasklist:*)",
+      "Bash(findstr:*)",
+      "Bash(cargo build:*)",
+      "Bash(target\\\\release\\\\ffvship.exe:*)",
+      "Bash(./target/release/ffvship.exe:*)",
+      "Bash(cmd /c:*)",
+      "Bash(powershell.exe -Command \"& ''./target/release/ffvship.exe'' --reference ''./bbb_sunflower_1080p_30fps_normal_1min.mp4'' --distorted ''./bbb_sunflower_1080p_30fps_normal_libx265_1min.mp4'' --end-frame 2\")",
+      "Bash(powershell.exe -Command \"cd E:/vship_vulkan_rust/shaders; ./compile.bat\")",
+      "Bash(powershell.exe -Command \"& ''./target/release/ffvship.exe'' --reference ''./bbb_sunflower_1080p_30fps_normal_1min.mp4'' --distorted ''./bbb_sunflower_1080p_30fps_normal_libx265_1min.mp4'' --end-frame 5\")",
+      "Bash(powershell.exe:*)",
+      "Bash(.\\\\target\\\\release\\\\ffvship.exe:*)",
+      "Bash(cmd.exe /c:*)",
+      "Bash(powershell -Command:*)"
+    ]
+  }
+}

@@ -114,28 +114,156 @@ fn main() -> Result<()> {
     println!("Video resolution: {}x{}", ref_reader.width(), ref_reader.height());
     println!("Frame count: {}", ref_reader.frame_count());
 
-    // Process frames
-    println!("\nProcessing frames...");
+    // Determine frame range
     let effective_end = if cli.end_frame == 0 {
         ref_reader.frame_count().min(dist_reader.frame_count())
     } else {
         cli.end_frame
     };
 
-    let total_frames = (effective_end - cli.start_frame) / cli.frame_step;
-    println!("Processing {} frames ({}..{}, step {})",
-             total_frames, cli.start_frame, effective_end, cli.frame_step);
+    let total_frames = (effective_end - cli.start_frame + cli.frame_step - 1) / cli.frame_step;
+
+    // Check if we need streaming mode (large frame range)
+    let frame_count = effective_end - cli.start_frame;
+    let use_streaming = frame_count > 500;  // ~12GB threshold for 1080p
+
+    #[cfg(feature = "ffmpeg")]
+    if use_streaming {
+        println!("\nUsing streaming mode for {} frames...", frame_count);
+        ref_reader.enable_streaming()?;
+        dist_reader.enable_streaming()?;
+    } else {
+        println!("\nLoading frames {} to {}...", cli.start_frame, effective_end);
+        ref_reader.load_frame_range(cli.start_frame, effective_end)?;
+        dist_reader.load_frame_range(cli.start_frame, effective_end)?;
+    }
+
+    // Process frames
+    println!("\nProcessing {} frames...\n", total_frames);
 
     let mut scores = Vec::new();
     let mut frame_numbers = Vec::new();
 
-    for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
-        if cli.verbose {
-            print!("\rFrame {}/{}: {}", i + 1, total_frames, frame_num);
-            use std::io::Write;
-            std::io::stdout().flush()?;
-        }
+    // Progress tracking
+    let start_time = std::time::Instant::now();
+    let mut last_update = start_time;
+    let mut frames_since_update = 0;
+    let mut current_fps = 0.0f64;
+    let mut running_sum = 0.0f64;
+    let mut last_score = 0.0f64;
 
+    // Helper to print progress with scores
+    let print_progress = |processed: usize, total: usize, fps: f64, elapsed: std::time::Duration,
+                          last: f64, avg: f64| {
+        let percent = (processed as f64 / total as f64 * 100.0).min(100.0);
+        let eta_secs = if fps > 0.0 {
+            (total - processed) as f64 / fps
+        } else {
+            0.0
+        };
+        let eta_min = (eta_secs / 60.0) as u32;
+        let eta_sec = (eta_secs % 60.0) as u32;
+        let elapsed_min = elapsed.as_secs() / 60;
+        let elapsed_sec = elapsed.as_secs() % 60;
+
+        print!("\r[{:>3.0}%] {}/{} | {:.1} fps | Score: {:.1} (avg {:.1}) | {:02}:{:02} ETA {:02}:{:02}  ",
+               percent, processed, total, fps, last, avg, elapsed_min, elapsed_sec, eta_min, eta_sec);
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+    };
+
+    #[cfg(feature = "ffmpeg")]
+    if use_streaming {
+        // Streaming mode: decode and process frames on-the-fly
+        let mut current_frame = 0;
+        let mut processed = 0;
+
+        while let Some(ref_frame) = ref_reader.decode_next()? {
+            // Get corresponding distorted frame
+            let dist_frame = match dist_reader.decode_next()? {
+                Some(f) => f,
+                None => {
+                    log::warn!("Distorted video ended before reference");
+                    break;
+                }
+            };
+
+            // Skip frames before start
+            if current_frame < cli.start_frame {
+                current_frame += 1;
+                continue;
+            }
+
+            // Stop if past end
+            if current_frame >= effective_end {
+                break;
+            }
+
+            // Only process at step intervals
+            if (current_frame - cli.start_frame) % cli.frame_step == 0 {
+                let score = metric.compute(&ref_frame, &dist_frame)
+                    .context(format!("Failed to compute metric for frame {}", current_frame))?;
+
+                scores.push(score);
+                frame_numbers.push(current_frame);
+                processed += 1;
+                frames_since_update += 1;
+                running_sum += score;
+                last_score = score;
+
+                // Update progress every 100ms or every frame if slow
+                let now = std::time::Instant::now();
+                if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                    let dt = now.duration_since(last_update).as_secs_f64();
+                    if dt > 0.0 {
+                        current_fps = frames_since_update as f64 / dt;
+                    }
+                    let avg_score = running_sum / processed as f64;
+                    print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                                   last_score, avg_score);
+                    last_update = now;
+                    frames_since_update = 0;
+                }
+            }
+
+            current_frame += 1;
+        }
+    } else {
+        // Cached mode: frames already loaded
+        for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
+            let ref_frame = ref_reader.read_frame(frame_num)
+                .context(format!("Failed to read reference frame {}", frame_num))?;
+
+            let dist_frame = dist_reader.read_frame(frame_num)
+                .context(format!("Failed to read distorted frame {}", frame_num))?;
+
+            let score = metric.compute(&ref_frame, &dist_frame)
+                .context(format!("Failed to compute metric for frame {}", frame_num))?;
+
+            scores.push(score);
+            frame_numbers.push(frame_num);
+            frames_since_update += 1;
+            running_sum += score;
+            last_score = score;
+
+            // Update progress every 100ms or every frame if slow
+            let now = std::time::Instant::now();
+            if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
+                let dt = now.duration_since(last_update).as_secs_f64();
+                if dt > 0.0 {
+                    current_fps = frames_since_update as f64 / dt;
+                }
+                let avg_score = running_sum / (i + 1) as f64;
+                print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
+                               last_score, avg_score);
+                last_update = now;
+                frames_since_update = 0;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "ffmpeg"))]
+    for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
         let ref_frame = ref_reader.read_frame(frame_num)
             .context(format!("Failed to read reference frame {}", frame_num))?;
 
@@ -147,11 +275,31 @@ fn main() -> Result<()> {
 
         scores.push(score);
         frame_numbers.push(frame_num);
+        frames_since_update += 1;
+        running_sum += score;
+        last_score = score;
+
+        // Update progress
+        let now = std::time::Instant::now();
+        if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
+            let dt = now.duration_since(last_update).as_secs_f64();
+            if dt > 0.0 {
+                current_fps = frames_since_update as f64 / dt;
+            }
+            let avg_score = running_sum / (i + 1) as f64;
+            print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
+                           last_score, avg_score);
+            last_update = now;
+            frames_since_update = 0;
+        }
     }
 
-    if cli.verbose {
-        println!();
-    }
+    // Final progress update
+    let total_elapsed = start_time.elapsed();
+    let avg_fps = scores.len() as f64 / total_elapsed.as_secs_f64();
+    let final_avg = if scores.is_empty() { 0.0 } else { running_sum / scores.len() as f64 };
+    println!("\r[100%] {} frames | {:.1} fps | Avg score: {:.2} | {:.1}s                           ",
+             scores.len(), avg_fps, final_avg, total_elapsed.as_secs_f64());
 
     // Compute statistics
     let mean_score = scores.iter().sum::<f64>() / scores.len() as f64;

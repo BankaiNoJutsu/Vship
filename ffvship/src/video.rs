@@ -7,10 +7,16 @@ use std::path::Path;
 #[cfg(feature = "ffmpeg")]
 use crate::ffmpeg_decoder::FfmpegDecoder;
 
-/// Video reader wrapper
+/// Video reader wrapper with streaming support
 pub struct VideoReader {
     #[cfg(feature = "ffmpeg")]
     decoder: FfmpegDecoder,
+    #[cfg(feature = "ffmpeg")]
+    frame_cache: Option<Vec<ImageData>>,
+    #[cfg(feature = "ffmpeg")]
+    cache_start_frame: usize,
+    #[cfg(feature = "ffmpeg")]
+    streaming_mode: bool,
 
     #[cfg(not(feature = "ffmpeg"))]
     width: u32,
@@ -30,7 +36,12 @@ impl VideoReader {
         #[cfg(feature = "ffmpeg")]
         {
             let decoder = FfmpegDecoder::open(path)?;
-            Ok(Self { decoder })
+            Ok(Self {
+                decoder,
+                frame_cache: None,
+                cache_start_frame: 0,
+                streaming_mode: false,
+            })
         }
 
         #[cfg(not(feature = "ffmpeg"))]
@@ -69,7 +80,13 @@ impl VideoReader {
     /// Get total frame count
     pub fn frame_count(&self) -> usize {
         #[cfg(feature = "ffmpeg")]
-        { self.decoder.frame_count() }
+        {
+            if let Some(ref cache) = self.frame_cache {
+                cache.len()
+            } else {
+                self.decoder.frame_count()
+            }
+        }
 
         #[cfg(not(feature = "ffmpeg"))]
         { self.frame_count }
@@ -84,11 +101,75 @@ impl VideoReader {
         { self.fps }
     }
 
+    /// Load a range of frames into cache (call this once before processing)
+    /// For large videos, consider using streaming mode instead
+    #[cfg(feature = "ffmpeg")]
+    pub fn load_frame_range(&mut self, start: usize, end: usize) -> Result<()> {
+        // Check if the range is too large (more than 500 frames or ~12GB for 1080p)
+        let frame_count = end.saturating_sub(start);
+        if frame_count > 500 {
+            log::info!("Large frame range detected ({}), using streaming mode", frame_count);
+            self.enable_streaming()?;
+            return Ok(());
+        }
+
+        if self.frame_cache.is_none() {
+            let frames = self.decoder.decode_frame_range(start, end)?;
+            self.cache_start_frame = start;
+            self.frame_cache = Some(frames);
+        }
+        Ok(())
+    }
+
+    /// Enable streaming mode (decode frames on-demand, no caching)
+    #[cfg(feature = "ffmpeg")]
+    pub fn enable_streaming(&mut self) -> Result<()> {
+        self.streaming_mode = true;
+        self.frame_cache = None;
+        self.decoder.init_streaming()?;
+        Ok(())
+    }
+
+    /// Decode the next frame in streaming mode
+    #[cfg(feature = "ffmpeg")]
+    pub fn decode_next(&mut self) -> Result<Option<ImageData>> {
+        if !self.streaming_mode {
+            anyhow::bail!("Not in streaming mode. Call enable_streaming() first");
+        }
+        self.decoder.decode_next_frame()
+    }
+
+    /// Check if in streaming mode
+    #[cfg(feature = "ffmpeg")]
+    pub fn is_streaming(&self) -> bool {
+        self.streaming_mode
+    }
+
+    /// Reset streaming position
+    #[cfg(feature = "ffmpeg")]
+    pub fn reset_streaming(&mut self) {
+        self.decoder.reset_streaming();
+    }
+
     /// Read a specific frame
     pub fn read_frame(&mut self, frame_num: usize) -> Result<ImageData> {
         #[cfg(feature = "ffmpeg")]
         {
-            self.decoder.read_frame(frame_num)
+            let cache = self.frame_cache.as_ref()
+                .context("Frames not loaded. Call load_frame_range() first")?;
+
+            // Convert absolute frame number to cache index
+            if frame_num < self.cache_start_frame {
+                anyhow::bail!("Frame {} not in cache (cache starts at {})", frame_num, self.cache_start_frame);
+            }
+
+            let cache_idx = frame_num - self.cache_start_frame;
+            if cache_idx >= cache.len() {
+                anyhow::bail!("Frame {} out of range (cache has {} frames starting at {})",
+                             frame_num, cache.len(), self.cache_start_frame);
+            }
+
+            Ok(cache[cache_idx].clone())
         }
 
         #[cfg(not(feature = "ffmpeg"))]
@@ -105,7 +186,9 @@ impl VideoReader {
     pub fn read_next_frame(&mut self) -> Result<Option<ImageData>> {
         #[cfg(feature = "ffmpeg")]
         {
-            self.decoder.read_next_frame()
+            // Not implemented with cache-based approach
+            // Use read_frame() with explicit frame numbers instead
+            Ok(None)
         }
 
         #[cfg(not(feature = "ffmpeg"))]

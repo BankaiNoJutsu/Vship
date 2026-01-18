@@ -7,7 +7,7 @@ use std::ptr;
 use std::sync::Arc;
 use vship_core::{VshipContext, error::VshipError};
 use vship_metrics::{MetricsContext, Metric, ImageData, ImageFormat};
-use vship_metrics::{Ssimulacra2, Butteraugli, Cvvdp};
+use vship_metrics::{Ssimulacra2Gpu, Butteraugli, Cvvdp};
 
 // Opaque handle types
 #[repr(C)]
@@ -68,7 +68,7 @@ struct VshipContextWrapper {
 }
 
 enum MetricWrapper {
-    Ssimulacra2(Ssimulacra2),
+    Ssimulacra2(Ssimulacra2Gpu),
     Butteraugli(Butteraugli),
     Cvvdp(Cvvdp),
 }
