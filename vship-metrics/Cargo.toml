@@ -9,6 +9,7 @@ description = "Psychovisual metrics implementations (SSIMULACRA2, Butteraugli, C
 
 [dependencies]
 vship-core = { path = "../vship-core" }
+ash.workspace = true
 glam.workspace = true
 nalgebra.workspace = true
 thiserror.workspace = true

@@ -129,6 +129,15 @@ impl BufferView {
         }
     }
 
+    /// Create a buffer view from an AllocatedBuffer
+    pub fn from_allocated(buffer: &AllocatedBuffer) -> Self {
+        Self {
+            buffer: buffer.buffer(),
+            offset: 0,
+            range: buffer.size(),
+        }
+    }
+
     /// Get descriptor buffer info for binding
     pub fn descriptor_info(&self) -> vk::DescriptorBufferInfo {
         vk::DescriptorBufferInfo::default()

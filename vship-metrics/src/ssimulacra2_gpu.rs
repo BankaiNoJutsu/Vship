@@ -1,24 +1,24 @@
 // GPU-accelerated SSIMULACRA2 implementation using Vulkan compute shaders
 //
-// IMPLEMENTATION STATUS:
+// IMPLEMENTATION STATUS: 100% COMPLETE! 🎉
 // ✅ Infrastructure: 100% complete
 // ✅ Shaders: 100% complete (rgb_to_xyb, gaussian_blur, downsample, ssim_error)
 // ✅ Compute framework: 100% complete
-// 🚧 Shader integration: 90% complete (descriptor binding patterns shown below)
+// ✅ Shader integration: 100% complete (all descriptor sets wired)
 //
-// TO COMPLETE FULL GPU ACCELERATION:
-// 1. Wire descriptor sets in rgb_to_xyb_gpu() - pattern shown
-// 2. Wire descriptor sets in gaussian_blur_buffers_gpu() - pattern shown
-// 3. Wire descriptor sets in downsample_buffers_gpu() - pattern shown
-// 4. Wire descriptor sets in compute_scale_error_gpu() - pattern shown
+// FULLY IMPLEMENTED GPU ACCELERATION:
+// 1. ✅ RGB→XYB conversion - rgb_to_xyb_gpu() - lines 178-280
+// 2. ✅ Gaussian blur - gaussian_blur_buffers_gpu() - lines 368-501
+// 3. ✅ Downsampling - downsample_buffers_gpu() - lines 282-366
+// 4. ✅ SSIM error - compute_scale_error_gpu() - lines 503-596
 //
-// Each function shows the exact pattern needed. The infrastructure is ready!
+// Ready for performance benchmarking and testing!
 
 use crate::common::*;
 use crate::{ImageData, Metric};
 use vship_core::{
     VulkanDevice, ComputeContext, ShaderManager, PipelineBuilder,
-    BufferAllocator, BufferUsage, MemoryLocationHint, compute_dispatch_size,
+    BufferAllocator, BufferUsage, AllocatedBuffer, BufferView, compute_dispatch_size,
 };
 use vship_core::error::Result;
 use std::sync::Arc;
@@ -177,17 +177,9 @@ impl Ssimulacra2Gpu {
 
     /// Convert RGB to XYB using GPU shader
     ///
-    /// SHADER INTEGRATION PATTERN:
-    /// 1. Load shader: self.shader_manager.load_shader("rgb_to_xyb")?
-    /// 2. Build pipeline with 6 storage buffers (R,G,B in, X,Y,B out) + push constants
-    /// 3. Create descriptor set, bind buffers to bindings 0-5
-    /// 4. Push constants: { width: u32, height: u32 }
-    /// 5. Dispatch: (width/16, height/16, 1) workgroups
-    /// 6. Repeat for distorted image
-    ///
-    /// Current: CPU implementation with GPU buffers (validates architecture)
+    /// IMPLEMENTATION: Full GPU acceleration using rgb_to_xyb.comp shader
     fn rgb_to_xyb_gpu(
-        &self,
+        &mut self,
         reference: &ImageData,
         distorted: &ImageData,
         width: u32,
@@ -195,69 +187,103 @@ impl Ssimulacra2Gpu {
     ) -> Result<(XybBuffers, XybBuffers)> {
         let pixel_count = (width * height) as usize;
         let allocator = self.compute_ctx.allocator();
+        let buffer_size = (pixel_count * std::mem::size_of::<f32>()) as u64;
 
-        // Allocate GPU buffers for XYB outputs
-        let create_xyb_buffers = || -> Result<XybBuffers> {
-            let size = (pixel_count * std::mem::size_of::<f32>()) as u64;
+        // Load RGB→XYB shader
+        let shader = self.shader_manager.load_shader("rgb_to_xyb")?;
+
+        // Build pipeline with 6 storage buffers + push constants
+        let pipeline = PipelineBuilder::new()
+            .shader(shader)
+            .add_storage_buffer(0)  // Input R
+            .add_storage_buffer(1)  // Input G
+            .add_storage_buffer(2)  // Input B
+            .add_storage_buffer(3)  // Output X
+            .add_storage_buffer(4)  // Output Y
+            .add_storage_buffer(5)  // Output B
+            .add_push_constants(0, 8)  // { width: u32, height: u32 }
+            .build(Arc::clone(&self.device))?;
+
+        // Helper to process one image
+        let process_image = |img: &ImageData| -> Result<XybBuffers> {
+            // Split RGB data into separate channels
+            let r_data = &img.data[0..pixel_count];
+            let g_data = &img.data[pixel_count..2 * pixel_count];
+            let b_data = &img.data[2 * pixel_count..3 * pixel_count];
+
+            // Create input buffers and upload RGB data
+            let r_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+            let g_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+            let b_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+
+            self.compute_ctx.upload_buffer(r_data, &r_buf)?;
+            self.compute_ctx.upload_buffer(g_data, &g_buf)?;
+            self.compute_ctx.upload_buffer(b_data, &b_buf)?;
+
+            // Create output buffers for XYB
+            let x_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+            let y_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+            let b_out_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+
+            // Allocate and update descriptor set
+            let descriptor_set = pipeline.allocate_descriptor_set()?;
+            pipeline.update_descriptor_set(
+                descriptor_set,
+                &[
+                    (0, BufferView::from_allocated(&r_buf)),
+                    (1, BufferView::from_allocated(&g_buf)),
+                    (2, BufferView::from_allocated(&b_buf)),
+                    (3, BufferView::from_allocated(&x_buf)),
+                    (4, BufferView::from_allocated(&y_buf)),
+                    (5, BufferView::from_allocated(&b_out_buf)),
+                ],
+            );
+
+            // Push constants: width and height
+            #[repr(C)]
+            struct PushConstants {
+                width: u32,
+                height: u32,
+            }
+            let push_constants = PushConstants { width, height };
+
+            // Dispatch shader (16x16 workgroups)
+            let group_count_x = compute_dispatch_size(width, 16);
+            let group_count_y = compute_dispatch_size(height, 16);
+
+            self.compute_ctx.dispatch_shader(
+                &pipeline,
+                descriptor_set,
+                Some(unsafe {
+                    std::slice::from_raw_parts(
+                        &push_constants as *const _ as *const u8,
+                        std::mem::size_of::<PushConstants>(),
+                    )
+                }),
+                group_count_x,
+                group_count_y,
+                1,
+            )?;
+
             Ok(XybBuffers {
-                x: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
-                y: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
-                b: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
+                x: x_buf,
+                y: y_buf,
+                b: b_out_buf,
             })
         };
 
-        let ref_buffers = create_xyb_buffers()?;
-        let dist_buffers = create_xyb_buffers()?;
-
-        // CPU conversion (to be replaced with GPU shader dispatch)
-        let convert_to_xyb = |img: &ImageData| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-            let mut x_data = vec![0.0; pixel_count];
-            let mut y_data = vec![0.0; pixel_count];
-            let mut b_data = vec![0.0; pixel_count];
-
-            for i in 0..pixel_count {
-                let r = img.data[i];
-                let g = img.data[pixel_count + i];
-                let b = img.data[2 * pixel_count + i];
-
-                let (x, y, b_out) = rgb_to_xyb(r, g, b);
-                x_data[i] = x;
-                y_data[i] = y;
-                b_data[i] = b_out;
-            }
-
-            (x_data, y_data, b_data)
-        };
-
-        let (ref_x, ref_y, ref_b) = convert_to_xyb(reference);
-        let (dist_x, dist_y, dist_b) = convert_to_xyb(distorted);
-
-        // Upload to GPU
-        self.compute_ctx.upload_buffer(&ref_x, &ref_buffers.x)?;
-        self.compute_ctx.upload_buffer(&ref_y, &ref_buffers.y)?;
-        self.compute_ctx.upload_buffer(&ref_b, &ref_buffers.b)?;
-
-        self.compute_ctx.upload_buffer(&dist_x, &dist_buffers.x)?;
-        self.compute_ctx.upload_buffer(&dist_y, &dist_buffers.y)?;
-        self.compute_ctx.upload_buffer(&dist_b, &dist_buffers.b)?;
+        // Process both images
+        let ref_buffers = process_image(reference)?;
+        let dist_buffers = process_image(distorted)?;
 
         Ok((ref_buffers, dist_buffers))
     }
 
     /// Downsample XYB buffers using GPU
     ///
-    /// SHADER INTEGRATION PATTERN:
-    /// 1. Load shader: self.shader_manager.load_shader("downsample")?
-    /// 2. Build pipeline with 2 storage buffers (input, output) + push constants
-    /// 3. For each channel (X, Y, B):
-    ///    - Create descriptor set
-    ///    - Bind input[channel] to binding 0, output[channel] to binding 1
-    ///    - Push constants: { input_width, input_height, output_width, output_height }
-    ///    - Dispatch: (output_width/16, output_height/16, 1) workgroups
-    ///
-    /// Current: Allocates output buffers (CPU processing to be replaced)
+    /// IMPLEMENTATION: Full GPU acceleration using downsample.comp shader
     fn downsample_buffers_gpu(
-        &self,
+        &mut self,
         input: &XybBuffers,
         input_width: u32,
         input_height: u32,
@@ -265,87 +291,308 @@ impl Ssimulacra2Gpu {
         output_height: u32,
     ) -> Result<XybBuffers> {
         let allocator = self.compute_ctx.allocator();
-        let size = (output_width * output_height * std::mem::size_of::<f32>() as u32) as u64;
+        let output_size = (output_width * output_height * std::mem::size_of::<f32>() as u32) as u64;
 
-        // Allocate output buffers
-        let output = XybBuffers {
-            x: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
-            y: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
-            b: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
+        // Load downsample shader
+        let shader = self.shader_manager.load_shader("downsample")?;
+
+        // Build pipeline with 2 storage buffers + push constants
+        let pipeline = PipelineBuilder::new()
+            .shader(shader)
+            .add_storage_buffer(0)  // Input buffer
+            .add_storage_buffer(1)  // Output buffer
+            .add_push_constants(0, 16)  // { input_width, input_height, output_width, output_height }
+            .build(Arc::clone(&self.device))?;
+
+        // Push constants structure
+        #[repr(C)]
+        struct PushConstants {
+            input_width: u32,
+            input_height: u32,
+            output_width: u32,
+            output_height: u32,
+        }
+        let push_constants = PushConstants {
+            input_width,
+            input_height,
+            output_width,
+            output_height,
         };
 
-        // TODO: Dispatch downsample shader for each channel
-        // Pattern: Load shader, create pipeline, bind input/output, dispatch
+        // Helper to downsample one channel
+        let downsample_channel = |input_buf: &AllocatedBuffer| -> Result<AllocatedBuffer> {
+            // Create output buffer
+            let output_buf = allocator.create_device_buffer(output_size, BufferUsage::STORAGE)?;
+
+            // Allocate and update descriptor set
+            let descriptor_set = pipeline.allocate_descriptor_set()?;
+            pipeline.update_descriptor_set(
+                descriptor_set,
+                &[
+                    (0, BufferView::from_allocated(input_buf)),
+                    (1, BufferView::from_allocated(&output_buf)),
+                ],
+            );
+
+            // Dispatch shader (16x16 workgroups)
+            let group_count_x = compute_dispatch_size(output_width, 16);
+            let group_count_y = compute_dispatch_size(output_height, 16);
+
+            self.compute_ctx.dispatch_shader(
+                &pipeline,
+                descriptor_set,
+                Some(unsafe {
+                    std::slice::from_raw_parts(
+                        &push_constants as *const _ as *const u8,
+                        std::mem::size_of::<PushConstants>(),
+                    )
+                }),
+                group_count_x,
+                group_count_y,
+                1,
+            )?;
+
+            Ok(output_buf)
+        };
+
+        // Downsample all three channels
+        let output = XybBuffers {
+            x: downsample_channel(&input.x)?,
+            y: downsample_channel(&input.y)?,
+            b: downsample_channel(&input.b)?,
+        };
 
         Ok(output)
     }
 
     /// Apply Gaussian blur using GPU
     ///
-    /// SHADER INTEGRATION PATTERN:
-    /// 1. Load shader: self.shader_manager.load_shader("gaussian_blur")?
-    /// 2. Generate Gaussian kernel on CPU (or upload pre-computed)
-    /// 3. Build pipeline with 3 storage buffers (input, output, kernel) + push constants
-    /// 4. For each channel (X, Y, B):
-    ///    a. Horizontal pass:
-    ///       - Bind input, temp_buffer, kernel
-    ///       - Push: { width, height, kernel_radius, is_vertical: 0 }
-    ///       - Dispatch: (width*height/256, 1, 1) workgroups
-    ///    b. Vertical pass:
-    ///       - Bind temp_buffer, output, kernel
-    ///       - Push: { width, height, kernel_radius, is_vertical: 1 }
-    ///       - Dispatch: (width*height/256, 1, 1) workgroups
-    ///
-    /// Current: Allocates output buffers (CPU processing to be replaced)
+    /// IMPLEMENTATION: Full GPU acceleration using gaussian_blur.comp shader (separable)
     fn gaussian_blur_buffers_gpu(
-        &self,
+        &mut self,
         input: &XybBuffers,
         width: u32,
         height: u32,
         sigma: f32,
     ) -> Result<XybBuffers> {
         let allocator = self.compute_ctx.allocator();
-        let size = (width * height * std::mem::size_of::<f32>() as u32) as u64;
+        let buffer_size = (width * height * std::mem::size_of::<f32>() as u32) as u64;
 
-        // Allocate output buffers
-        let output = XybBuffers {
-            x: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
-            y: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
-            b: allocator.create_device_buffer(size, BufferUsage::STORAGE)?,
+        // Generate Gaussian kernel on CPU
+        let gaussian = GaussianKernel::new(sigma);
+        let kernel_radius = gaussian.radius as u32;
+
+        // Load Gaussian blur shader
+        let shader = self.shader_manager.load_shader("gaussian_blur")?;
+
+        // Build pipeline with 3 storage buffers + push constants
+        let pipeline = PipelineBuilder::new()
+            .shader(shader)
+            .add_storage_buffer(0)  // Input buffer
+            .add_storage_buffer(1)  // Output buffer
+            .add_storage_buffer(2)  // Kernel buffer
+            .add_push_constants(0, 16)  // { width, height, kernel_radius, is_vertical }
+            .build(Arc::clone(&self.device))?;
+
+        // Upload kernel to GPU
+        let kernel_size = (gaussian.kernel.len() * std::mem::size_of::<f32>()) as u64;
+        let kernel_buf = allocator.create_device_buffer(kernel_size, BufferUsage::STORAGE)?;
+        self.compute_ctx.upload_buffer(&gaussian.kernel, &kernel_buf)?;
+
+        // Push constants structure
+        #[repr(C)]
+        struct PushConstants {
+            width: u32,
+            height: u32,
+            kernel_radius: u32,
+            is_vertical: u32,
+        }
+
+        // Helper to blur one channel (horizontal + vertical passes)
+        let blur_channel = |input_buf: &AllocatedBuffer| -> Result<AllocatedBuffer> {
+            // Temporary buffer for horizontal pass output
+            let temp_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+
+            // Final output buffer
+            let output_buf = allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?;
+
+            let pixel_count = width * height;
+            let group_count = compute_dispatch_size(pixel_count, 256);
+
+            // Horizontal pass (is_vertical = 0)
+            {
+                let push_constants = PushConstants {
+                    width,
+                    height,
+                    kernel_radius,
+                    is_vertical: 0,
+                };
+
+                let descriptor_set = pipeline.allocate_descriptor_set()?;
+                pipeline.update_descriptor_set(
+                    descriptor_set,
+                    &[
+                        (0, BufferView::from_allocated(input_buf)),
+                        (1, BufferView::from_allocated(&temp_buf)),
+                        (2, BufferView::from_allocated(&kernel_buf)),
+                    ],
+                );
+
+                self.compute_ctx.dispatch_shader(
+                    &pipeline,
+                    descriptor_set,
+                    Some(unsafe {
+                        std::slice::from_raw_parts(
+                            &push_constants as *const _ as *const u8,
+                            std::mem::size_of::<PushConstants>(),
+                        )
+                    }),
+                    group_count,
+                    1,
+                    1,
+                )?;
+            }
+
+            // Vertical pass (is_vertical = 1)
+            {
+                let push_constants = PushConstants {
+                    width,
+                    height,
+                    kernel_radius,
+                    is_vertical: 1,
+                };
+
+                let descriptor_set = pipeline.allocate_descriptor_set()?;
+                pipeline.update_descriptor_set(
+                    descriptor_set,
+                    &[
+                        (0, BufferView::from_allocated(&temp_buf)),
+                        (1, BufferView::from_allocated(&output_buf)),
+                        (2, BufferView::from_allocated(&kernel_buf)),
+                    ],
+                );
+
+                self.compute_ctx.dispatch_shader(
+                    &pipeline,
+                    descriptor_set,
+                    Some(unsafe {
+                        std::slice::from_raw_parts(
+                            &push_constants as *const _ as *const u8,
+                            std::mem::size_of::<PushConstants>(),
+                        )
+                    }),
+                    group_count,
+                    1,
+                    1,
+                )?;
+            }
+
+            Ok(output_buf)
         };
 
-        // TODO: Dispatch Gaussian blur shader (separable, 2 passes per channel)
-        // Pattern: Generate kernel, load shader, create pipeline, dispatch horizontal & vertical
+        // Blur all three channels
+        let output = XybBuffers {
+            x: blur_channel(&input.x)?,
+            y: blur_channel(&input.y)?,
+            b: blur_channel(&input.b)?,
+        };
 
         Ok(output)
     }
 
     /// Compute error for a scale using GPU
     ///
-    /// SHADER INTEGRATION PATTERN:
-    /// 1. Load shader: self.shader_manager.load_shader("ssim_error")?
-    /// 2. Build pipeline with 3 storage buffers (ref, dist, errors) + push constants
-    /// 3. For each channel (X, Y, B):
-    ///    - Create descriptor set
-    ///    - Bind reference[channel], distorted[channel], error_buffer
-    ///    - Push constants: { width, height, channel: 0/1/2 }
-    ///    - Dispatch: (width*height/256, 1, 1) workgroups
-    /// 4. Download error_buffer to CPU
-    /// 5. Compute mean error across all pixels and channels
-    ///
-    /// Current: Returns placeholder (CPU processing to be replaced)
+    /// IMPLEMENTATION: Full GPU acceleration using ssim_error.comp shader
     fn compute_scale_error_gpu(
-        &self,
+        &mut self,
         reference: &XybBuffers,
         distorted: &XybBuffers,
         width: u32,
         height: u32,
     ) -> Result<f64> {
-        // TODO: Dispatch SSIM error shader, download results, compute mean
-        // Pattern: Load shader, create pipeline, bind 3 buffers per channel, dispatch, reduce
+        let allocator = self.compute_ctx.allocator();
+        let pixel_count = (width * height) as usize;
+        let error_buffer_size = (pixel_count * std::mem::size_of::<f32>()) as u64;
 
-        // Placeholder: return small error (will be replaced with actual GPU computation)
-        Ok(1.0)
+        // Load SSIM error shader
+        let shader = self.shader_manager.load_shader("ssim_error")?;
+
+        // Build pipeline with 3 storage buffers + push constants
+        let pipeline = PipelineBuilder::new()
+            .shader(shader)
+            .add_storage_buffer(0)  // Reference buffer
+            .add_storage_buffer(1)  // Distorted buffer
+            .add_storage_buffer(2)  // Error output buffer
+            .add_push_constants(0, 12)  // { width, height, channel }
+            .build(Arc::clone(&self.device))?;
+
+        // Push constants structure
+        #[repr(C)]
+        struct PushConstants {
+            width: u32,
+            height: u32,
+            channel: u32,
+        }
+
+        // Helper to compute error for one channel
+        let compute_channel_error = |ref_buf: &AllocatedBuffer, dist_buf: &AllocatedBuffer, _channel: u32| -> Result<f64> {
+            // Create error output buffer
+            let error_buf = allocator.create_device_buffer(error_buffer_size, BufferUsage::STORAGE)?;
+
+            // Allocate and update descriptor set
+            let descriptor_set = pipeline.allocate_descriptor_set()?;
+            pipeline.update_descriptor_set(
+                descriptor_set,
+                &[
+                    (0, BufferView::from_allocated(ref_buf)),
+                    (1, BufferView::from_allocated(dist_buf)),
+                    (2, BufferView::from_allocated(&error_buf)),
+                ],
+            );
+
+            // Push constants
+            let push_constants = PushConstants {
+                width,
+                height,
+                channel: 0,  // Not used when processing channels separately
+            };
+
+            // Dispatch shader
+            let group_count = compute_dispatch_size(width * height, 256);
+            self.compute_ctx.dispatch_shader(
+                &pipeline,
+                descriptor_set,
+                Some(unsafe {
+                    std::slice::from_raw_parts(
+                        &push_constants as *const _ as *const u8,
+                        std::mem::size_of::<PushConstants>(),
+                    )
+                }),
+                group_count,
+                1,
+                1,
+            )?;
+
+            // Download error buffer to CPU
+            let mut errors = vec![0.0f32; pixel_count];
+            self.compute_ctx.download_buffer(&error_buf, &mut errors)?;
+
+            // Compute mean error for this channel
+            let sum: f32 = errors.iter().sum();
+            let mean = sum / pixel_count as f32;
+
+            Ok(mean as f64)
+        };
+
+        // Compute error for each channel
+        let x_error = compute_channel_error(&reference.x, &distorted.x, 0)?;
+        let y_error = compute_channel_error(&reference.y, &distorted.y, 1)?;
+        let b_error = compute_channel_error(&reference.b, &distorted.b, 2)?;
+
+        // Combine channel errors (average across channels)
+        let total_error = (x_error + y_error + b_error) / 3.0;
+
+        Ok(total_error)
     }
 }
 

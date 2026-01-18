@@ -3,7 +3,7 @@
 use crate::device::VulkanDevice;
 use crate::memory::{AllocatedBuffer, BufferAllocator};
 use crate::pipeline::ComputePipeline;
-use crate::error::{Result, VshipError};
+use crate::error::Result;
 use ash::vk;
 use std::sync::Arc;
 
@@ -212,7 +212,7 @@ impl ComputeContext {
 impl Drop for ComputeContext {
     fn drop(&mut self) {
         unsafe {
-            self.device.device_wait_idle().ok();
+            self.device.wait_idle().ok();
             self.device.destroy_fence(self.fence);
             self.device.free_command_buffers(&self.command_buffers);
         }

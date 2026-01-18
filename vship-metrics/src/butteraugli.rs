@@ -51,13 +51,13 @@ impl Butteraugli {
         let dist_rgb = distorted.to_linear_rgb();
 
         let size = (reference.width * reference.height) as usize;
-        let mut total_diff = 0.0;
+        let mut total_diff = 0.0f64;
 
         // Simple perceptual difference (placeholder)
         for i in 0..(size * 3) {
             let diff = (ref_rgb.data[i] - dist_rgb.data[i]).abs();
             // Apply simple psychovisual weighting
-            let weighted_diff = diff * self.perceptual_weight(ref_rgb.data[i]);
+            let weighted_diff = diff as f64 * self.perceptual_weight(ref_rgb.data[i]);
             total_diff += weighted_diff;
         }
 

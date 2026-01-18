@@ -2,6 +2,7 @@
 // Implements SSIMULACRA2, Butteraugli, and CVVDP
 
 pub mod ssimulacra2;
+pub mod ssimulacra2_gpu;
 pub mod butteraugli;
 pub mod cvvdp;
 pub mod common;
@@ -10,6 +11,7 @@ pub mod common;
 mod tests;
 
 pub use ssimulacra2::Ssimulacra2;
+pub use ssimulacra2_gpu::Ssimulacra2Gpu;
 pub use butteraugli::Butteraugli;
 pub use cvvdp::Cvvdp;
 
@@ -98,9 +100,15 @@ impl MetricsContext {
         Ok(Self { vship_ctx })
     }
 
-    /// Create SSIMULACRA2 metric
+    /// Create SSIMULACRA2 metric (CPU)
     pub fn create_ssimulacra2(&self) -> Result<Ssimulacra2> {
         Ssimulacra2::new(self.vship_ctx.default_device())
+    }
+
+    /// Create SSIMULACRA2 metric (GPU-accelerated)
+    pub fn create_ssimulacra2_gpu(&self) -> Result<Ssimulacra2Gpu> {
+        use ssimulacra2_gpu::Ssimulacra2Gpu;
+        Ssimulacra2Gpu::new(self.vship_ctx.default_device(), self.vship_ctx.instance())
     }
 
     /// Create Butteraugli metric

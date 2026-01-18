@@ -12,7 +12,7 @@ pub mod error;
 pub mod color;
 
 pub use device::{VulkanDevice, DeviceSelector};
-pub use memory::{BufferAllocator, BufferUsage};
+pub use memory::{BufferAllocator, BufferUsage, AllocatedBuffer};
 pub use pipeline::{ComputePipeline, PipelineBuilder};
 pub use buffer::{Buffer, BufferView};
 pub use shader::ShaderModule;
@@ -70,6 +70,11 @@ impl VshipContext {
             instance,
             devices,
         })
+    }
+
+    /// Get the Vulkan instance
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance
     }
 
     /// Get all available devices
