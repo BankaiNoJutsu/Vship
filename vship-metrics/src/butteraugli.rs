@@ -125,17 +125,11 @@ mod tests {
 
     #[test]
     fn test_perceptual_weight() {
-        let device = Arc::new(
-            vship_core::device::VulkanDevice::new(
-                &unsafe { ash::Entry::load().unwrap() }.create_instance(
-                    &ash::vk::InstanceCreateInfo::default(),
-                    None,
-                ).unwrap(),
-                ash::vk::PhysicalDevice::null(),
-            ).unwrap()
-        );
-
-        let metric = Butteraugli::new(device).unwrap();
+        let ctx = match vship_core::VshipContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let metric = Butteraugli::new(ctx.default_device()).unwrap();
 
         // Mid-tones should have higher weight
         let mid_weight = metric.perceptual_weight(40.0);

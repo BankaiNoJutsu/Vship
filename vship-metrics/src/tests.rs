@@ -175,4 +175,25 @@ mod tests {
         assert_eq!(img.data[0], 0.0);
         assert!((img.data[47] - 47.0 / 48.0).abs() < 0.001);
     }
+
+    #[test]
+    fn test_image_data_from_rgba8() {
+        let width = 2;
+        let height = 1;
+        let data = vec![
+            255, 0, 0, 255,
+            0, 128, 255, 64,
+        ];
+
+        let img = ImageData::from_rgba8(width, height, &data).unwrap();
+        assert_eq!(img.width, width);
+        assert_eq!(img.height, height);
+        assert_eq!(img.data.len(), 6);
+        assert!((img.data[0] - 1.0).abs() < 0.001);
+        assert!((img.data[1] - 0.0).abs() < 0.001);
+        assert!((img.data[2] - 0.0).abs() < 0.001);
+        assert!((img.data[3] - (128.0 / 255.0)).abs() < 0.001);
+        assert!((img.data[4] - 0.0).abs() < 0.001);
+        assert!((img.data[5] - 1.0).abs() < 0.001);
+    }
 }

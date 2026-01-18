@@ -1,7 +1,7 @@
 // FFmpeg video decoder implementation
 
 use anyhow::{Result, Context};
-use vship_metrics::{ImageData, ImageFormat};
+use vship_metrics::ImageDataRgba8;
 use std::path::Path;
 
 /// FFmpeg-based video decoder with streaming support
@@ -16,6 +16,8 @@ pub struct FfmpegDecoder {
     input: Option<ffmpeg_next::format::context::Input>,
     decoder: Option<ffmpeg_next::decoder::Video>,
     video_stream_index: usize,
+    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    rgba_frame: Option<ffmpeg_next::util::frame::Video>,
 }
 
 impl FfmpegDecoder {
@@ -69,6 +71,8 @@ impl FfmpegDecoder {
             input: None,
             decoder: None,
             video_stream_index: 0,
+            scaler: None,
+            rgba_frame: None,
         })
     }
 
@@ -104,18 +108,17 @@ impl FfmpegDecoder {
     }
 
     /// Decode the next frame in sequence (streaming mode)
-    pub fn decode_next_frame(&mut self) -> Result<Option<ImageData>> {
+    pub fn decode_next_frame(&mut self) -> Result<Option<ImageDataRgba8>> {
         self.init_streaming()?;
 
         let input = self.input.as_mut().unwrap();
         let decoder = self.decoder.as_mut().unwrap();
-        let pixel_count = (self.width * self.height) as usize;
 
         // Try to get a frame from already-sent packets
         let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
         if decoder.receive_frame(&mut decoded_frame).is_ok() {
             self.current_frame += 1;
-            return Ok(Some(self.convert_frame_to_image(&decoded_frame, pixel_count)?));
+            return Ok(Some(self.convert_frame_to_rgba8(&decoded_frame)?));
         }
 
         // Need to send more packets
@@ -126,7 +129,7 @@ impl FfmpegDecoder {
 
                 if decoder.receive_frame(&mut decoded_frame).is_ok() {
                     self.current_frame += 1;
-                    return Ok(Some(self.convert_frame_to_image(&decoded_frame, pixel_count)?));
+                    return Ok(Some(self.convert_frame_to_rgba8(&decoded_frame)?));
                 }
             }
         }
@@ -135,7 +138,7 @@ impl FfmpegDecoder {
         decoder.send_eof().ok();
         if decoder.receive_frame(&mut decoded_frame).is_ok() {
             self.current_frame += 1;
-            return Ok(Some(self.convert_frame_to_image(&decoded_frame, pixel_count)?));
+            return Ok(Some(self.convert_frame_to_rgba8(&decoded_frame)?));
         }
 
         Ok(None) // End of video
@@ -175,7 +178,7 @@ impl FfmpegDecoder {
 
     /// Decode a range of frames (start..end)
     /// Much more memory-efficient than decoding all frames
-    pub fn decode_frame_range(&self, start: usize, end: usize) -> Result<Vec<ImageData>> {
+    pub fn decode_frame_range(&mut self, start: usize, end: usize) -> Result<Vec<ImageDataRgba8>> {
         let actual_end = end.min(self.frame_count);
         let num_frames = actual_end.saturating_sub(start);
 
@@ -199,7 +202,6 @@ impl FfmpegDecoder {
             .video()
             .context("Failed to create video decoder")?;
 
-        let pixel_count = (self.width * self.height) as usize;
         let mut frames = Vec::new();
         frames.reserve(num_frames);
 
@@ -216,7 +218,7 @@ impl FfmpegDecoder {
                 while decoder.receive_frame(&mut decoded_frame).is_ok() {
                     // Only keep frames in the requested range
                     if current_frame_idx >= start && current_frame_idx < actual_end {
-                        let image = self.convert_frame_to_image(&decoded_frame, pixel_count)?;
+                        let image = self.convert_frame_to_rgba8(&decoded_frame)?;
                         frames.push(image);
 
                         if frames.len() % 50 == 0 {
@@ -240,7 +242,7 @@ impl FfmpegDecoder {
         let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
         while decoder.receive_frame(&mut decoded_frame).is_ok() {
             if current_frame_idx >= start && current_frame_idx < actual_end {
-                let image = self.convert_frame_to_image(&decoded_frame, pixel_count)?;
+                let image = self.convert_frame_to_rgba8(&decoded_frame)?;
                 frames.push(image);
             }
             current_frame_idx += 1;
@@ -254,40 +256,41 @@ impl FfmpegDecoder {
         Ok(frames)
     }
 
-    /// Convert an FFmpeg frame to ImageData
-    fn convert_frame_to_image(&self, frame: &ffmpeg_next::util::frame::Video, pixel_count: usize) -> Result<ImageData> {
-        // Convert frame to RGB using swscale
-        let mut scaler = ffmpeg_next::software::scaling::Context::get(
-            frame.format(),
-            frame.width(),
-            frame.height(),
-            ffmpeg_next::util::format::Pixel::RGB24,
-            self.width,
-            self.height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        ).context("Failed to create scaler")?;
+    /// Convert an FFmpeg frame to packed RGBA8
+    fn convert_frame_to_rgba8(
+        &mut self,
+        frame: &ffmpeg_next::util::frame::Video,
+    ) -> Result<ImageDataRgba8> {
+        if self.scaler.is_none() {
+            let scaler = ffmpeg_next::software::scaling::Context::get(
+                frame.format(),
+                frame.width(),
+                frame.height(),
+                ffmpeg_next::util::format::Pixel::RGBA,
+                self.width,
+                self.height,
+                ffmpeg_next::software::scaling::Flags::BILINEAR,
+            ).context("Failed to create scaler")?;
+            self.scaler = Some(scaler);
+        }
 
-        let mut rgb_frame = ffmpeg_next::util::frame::Video::empty();
-        scaler.run(frame, &mut rgb_frame)
+        let rgba_frame = self.rgba_frame.get_or_insert_with(ffmpeg_next::util::frame::Video::empty);
+        self.scaler
+            .as_mut()
+            .unwrap()
+            .run(frame, rgba_frame)
             .context("Failed to scale frame")?;
 
-        // Convert to ImageData format (planar RGB, values 0.0-1.0)
-        let mut image = ImageData::new(self.width, self.height, ImageFormat::RGB);
+        let data = rgba_frame.data(0);
+        let stride = rgba_frame.stride(0) as usize;
+        let row_bytes = self.width as usize * 4;
 
-        // RGB24 is packed format: RGBRGBRGB...
-        let data = rgb_frame.data(0);
-        let stride = rgb_frame.stride(0) as usize;
-
+        let mut image = ImageDataRgba8::new(self.width, self.height);
         for y in 0..self.height as usize {
-            for x in 0..self.width as usize {
-                let src_idx = y * stride + x * 3;
-                let dst_idx = y * self.width as usize + x;
-
-                // Convert from [0, 255] to [0.0, 1.0] and store in planar format
-                image.data[dst_idx] = data[src_idx] as f32 / 255.0;  // R
-                image.data[pixel_count + dst_idx] = data[src_idx + 1] as f32 / 255.0;  // G
-                image.data[2 * pixel_count + dst_idx] = data[src_idx + 2] as f32 / 255.0;  // B
-            }
+            let src = y * stride;
+            let dst = y * row_bytes;
+            image.data[dst..dst + row_bytes]
+                .copy_from_slice(&data[src..src + row_bytes]);
         }
 
         Ok(image)

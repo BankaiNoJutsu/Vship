@@ -15,15 +15,29 @@
 // Ready for performance benchmarking and testing!
 
 use crate::common::*;
-use crate::{ImageData, Metric};
+use crate::{ComputeMode, ReduceMode, ImageData, ImageDataRgba8, Metric};
 use vship_core::{
     VulkanDevice, ComputeContext, ShaderManager, PipelineBuilder, ComputePipeline,
     BufferUsage, AllocatedBuffer, BufferView, compute_dispatch_size,
 };
+use vship_core::compute::ComputeBatch;
 use vship_core::error::Result;
 use std::sync::Arc;
 
 const NUM_SCALES: usize = 6;
+const REDUCE_GROUP_SIZE: u32 = 256;
+const RGB_WORKGROUP_SIZE: u32 = 16;
+
+enum InputRgb<'a> {
+    F32 {
+        reference: &'a ImageData,
+        distorted: &'a ImageData,
+    },
+    Rgba8 {
+        reference: &'a ImageDataRgba8,
+        distorted: &'a ImageDataRgba8,
+    },
+}
 
 /// GPU-accelerated SSIMULACRA2 configuration
 #[derive(Debug, Clone)]
@@ -45,10 +59,12 @@ impl Default for Ssimulacra2GpuConfig {
 
 /// Cached pipelines for GPU operations
 struct CachedPipelines {
+    rgba8_to_planar: ComputePipeline,
     rgb_to_xyb: ComputePipeline,
     gaussian_blur: ComputePipeline,
     downsample: ComputePipeline,
     ssim_error: ComputePipeline,
+    reduce_sum: ComputePipeline,
 }
 
 /// Cached buffers for GPU operations (reused across frames)
@@ -61,6 +77,10 @@ struct CachedBuffers {
     // RGB input buffers (3 ref + 3 dist)
     ref_rgb: Option<[AllocatedBuffer; 3]>,
     dist_rgb: Option<[AllocatedBuffer; 3]>,
+
+    // Packed RGBA8 input buffers (1 ref + 1 dist)
+    ref_rgba8: Option<AllocatedBuffer>,
+    dist_rgba8: Option<AllocatedBuffer>,
 
     // XYB output buffers at scale 0 (3 ref + 3 dist)
     ref_xyb_scale0: Option<XybBuffers>,
@@ -79,6 +99,10 @@ struct CachedBuffers {
 
     // Error computation buffers (3 channels, reused across all 6 scales)
     error_buffers: Option<[AllocatedBuffer; 3]>,
+
+    // Reduction scratch buffers for GPU sum
+    reduce_scratch_a: Option<AllocatedBuffer>,
+    reduce_scratch_b: Option<AllocatedBuffer>,
 }
 
 impl CachedBuffers {
@@ -88,6 +112,8 @@ impl CachedBuffers {
             height: 0,
             ref_rgb: None,
             dist_rgb: None,
+            ref_rgba8: None,
+            dist_rgba8: None,
             ref_xyb_scale0: None,
             dist_xyb_scale0: None,
             ref_pyramid: None,
@@ -96,6 +122,8 @@ impl CachedBuffers {
             dist_blurred: None,
             blur_temp: None,
             error_buffers: None,
+            reduce_scratch_a: None,
+            reduce_scratch_b: None,
         }
     }
 
@@ -111,6 +139,8 @@ pub struct Ssimulacra2Gpu {
     #[allow(dead_code)]
     shader_manager: ShaderManager,
     config: Ssimulacra2GpuConfig,
+    compute_mode: ComputeMode,
+    reduce_mode: ReduceMode,
     // Cached pipelines for performance
     pipelines: CachedPipelines,
     // Cached kernel buffer for Gaussian blur
@@ -118,6 +148,7 @@ pub struct Ssimulacra2Gpu {
     last_kernel_sigma: f32,
     // Cached buffers for GPU operations (reused across frames)
     cached_buffers: CachedBuffers,
+    last_frame_gpu_time_ns: u64,
 }
 
 impl Ssimulacra2Gpu {
@@ -130,6 +161,16 @@ impl Ssimulacra2Gpu {
         shader_manager.preload_common_shaders()?;
 
         // Build and cache all pipelines upfront
+        let rgba8_to_planar_shader = shader_manager.load_shader("rgba8_to_planar")?;
+        let rgba8_to_planar = PipelineBuilder::new()
+            .shader(rgba8_to_planar_shader)
+            .add_storage_buffer(0)  // Input RGBA8 packed buffer
+            .add_storage_buffer(1)  // Output R
+            .add_storage_buffer(2)  // Output G
+            .add_storage_buffer(3)  // Output B
+            .add_push_constants(0, 8)  // { width: u32, height: u32 }
+            .build(Arc::clone(&device))?;
+
         let rgb_to_xyb_shader = shader_manager.load_shader("rgb_to_xyb")?;
         let rgb_to_xyb = PipelineBuilder::new()
             .shader(rgb_to_xyb_shader)
@@ -170,11 +211,21 @@ impl Ssimulacra2Gpu {
             .add_push_constants(0, 16)  // { width, height, C1, C2 }
             .build(Arc::clone(&device))?;
 
+        let reduce_sum_shader = shader_manager.load_shader("reduce_sum")?;
+        let reduce_sum = PipelineBuilder::new()
+            .shader(reduce_sum_shader)
+            .add_storage_buffer(0)  // Input buffer
+            .add_storage_buffer(1)  // Output buffer
+            .add_push_constants(0, 4)  // { element_count }
+            .build(Arc::clone(&device))?;
+
         let pipelines = CachedPipelines {
+            rgba8_to_planar,
             rgb_to_xyb,
             gaussian_blur,
             downsample,
             ssim_error,
+            reduce_sum,
         };
 
         Ok(Self {
@@ -182,10 +233,13 @@ impl Ssimulacra2Gpu {
             compute_ctx,
             shader_manager,
             config: Ssimulacra2GpuConfig::default(),
+            compute_mode: ComputeMode::SingleBatch,
+            reduce_mode: ReduceMode::Gpu,
             pipelines,
             kernel_buffer: None,
             last_kernel_sigma: 0.0,
             cached_buffers: CachedBuffers::new(),
+            last_frame_gpu_time_ns: 0,
         })
     }
 
@@ -199,6 +253,7 @@ impl Ssimulacra2Gpu {
         let allocator = self.compute_ctx.allocator();
         let pixel_count = (width * height) as usize;
         let buffer_size = (pixel_count * std::mem::size_of::<f32>()) as u64;
+        let rgba8_buffer_size = (pixel_count * 4) as u64;
 
         // RGB input buffers (scale 0 size)
         self.cached_buffers.ref_rgb = Some([
@@ -211,6 +266,11 @@ impl Ssimulacra2Gpu {
             allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?,
             allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?,
         ]);
+
+        self.cached_buffers.ref_rgba8 =
+            Some(allocator.create_device_buffer(rgba8_buffer_size, BufferUsage::STORAGE)?);
+        self.cached_buffers.dist_rgba8 =
+            Some(allocator.create_device_buffer(rgba8_buffer_size, BufferUsage::STORAGE)?);
 
         // XYB buffers at scale 0
         self.cached_buffers.ref_xyb_scale0 = Some(XybBuffers {
@@ -278,6 +338,13 @@ impl Ssimulacra2Gpu {
             allocator.create_device_buffer(buffer_size, BufferUsage::STORAGE)?,
         ]);
 
+        let reduce_group_count = compute_dispatch_size(pixel_count as u32, REDUCE_GROUP_SIZE) as u64;
+        let reduce_buffer_size = reduce_group_count * std::mem::size_of::<f32>() as u64;
+        self.cached_buffers.reduce_scratch_a =
+            Some(allocator.create_device_buffer(reduce_buffer_size, BufferUsage::STORAGE)?);
+        self.cached_buffers.reduce_scratch_b =
+            Some(allocator.create_device_buffer(reduce_buffer_size, BufferUsage::STORAGE)?);
+
         self.cached_buffers.width = width;
         self.cached_buffers.height = height;
 
@@ -285,55 +352,534 @@ impl Ssimulacra2Gpu {
         Ok(())
     }
 
+    fn score_from_mean_error(mean_error: f64) -> f64 {
+        if mean_error < 1e-10 {
+            100.0
+        } else {
+            let score = 100.0 * (-200.0 * mean_error).exp();
+            score.max(0.0).min(100.0)
+        }
+    }
+
+    fn input_dims(input: &InputRgb<'_>) -> Result<(u32, u32)> {
+        match input {
+            InputRgb::F32 { reference, distorted } => {
+                if reference.width != distorted.width || reference.height != distorted.height {
+                    return Err(vship_core::error::VshipError::InvalidDimensions {
+                        width: distorted.width,
+                        height: distorted.height,
+                    });
+                }
+                Ok((reference.width, reference.height))
+            }
+            InputRgb::Rgba8 { reference, distorted } => {
+                if reference.width != distorted.width || reference.height != distorted.height {
+                    return Err(vship_core::error::VshipError::InvalidDimensions {
+                        width: distorted.width,
+                        height: distorted.height,
+                    });
+                }
+                Ok((reference.width, reference.height))
+            }
+        }
+    }
+
+    fn record_upload_rgb_inputs(
+        &self,
+        batch: &mut ComputeBatch<'_>,
+        input: &InputRgb<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let pixel_count = (width * height) as usize;
+        let ref_rgb = self.cached_buffers.ref_rgb.as_ref().unwrap();
+        let dist_rgb = self.cached_buffers.dist_rgb.as_ref().unwrap();
+
+        match input {
+            InputRgb::F32 { reference, distorted } => {
+                batch.record_upload_buffer(&reference.data[0..pixel_count], &ref_rgb[0])?;
+                batch.record_upload_buffer(&reference.data[pixel_count..2 * pixel_count], &ref_rgb[1])?;
+                batch.record_upload_buffer(&reference.data[2 * pixel_count..3 * pixel_count], &ref_rgb[2])?;
+                batch.record_upload_buffer(&distorted.data[0..pixel_count], &dist_rgb[0])?;
+                batch.record_upload_buffer(&distorted.data[pixel_count..2 * pixel_count], &dist_rgb[1])?;
+                batch.record_upload_buffer(&distorted.data[2 * pixel_count..3 * pixel_count], &dist_rgb[2])?;
+                batch.record_transfer_to_compute_barrier();
+                Ok(())
+            }
+            InputRgb::Rgba8 { reference, distorted } => {
+                let expected_len = pixel_count * 4;
+                if reference.data.len() != expected_len {
+                    return Err(vship_core::error::VshipError::InvalidBufferSize {
+                        expected: expected_len,
+                        actual: reference.data.len(),
+                    });
+                }
+                if distorted.data.len() != expected_len {
+                    return Err(vship_core::error::VshipError::InvalidBufferSize {
+                        expected: expected_len,
+                        actual: distorted.data.len(),
+                    });
+                }
+                let ref_rgba8 = self.cached_buffers.ref_rgba8.as_ref().unwrap();
+                let dist_rgba8 = self.cached_buffers.dist_rgba8.as_ref().unwrap();
+
+                batch.record_upload_buffer(&reference.data, ref_rgba8)?;
+                batch.record_upload_buffer(&distorted.data, dist_rgba8)?;
+                batch.record_transfer_to_compute_barrier();
+
+                #[repr(C)]
+                struct PushConstants {
+                    width: u32,
+                    height: u32,
+                }
+                let push = PushConstants { width, height };
+                let group_count_x = compute_dispatch_size(width, RGB_WORKGROUP_SIZE);
+                let group_count_y = compute_dispatch_size(height, RGB_WORKGROUP_SIZE);
+
+                let descriptor_set = self.pipelines.rgba8_to_planar.allocate_descriptor_set()?;
+                self.pipelines.rgba8_to_planar.update_descriptor_set(
+                    descriptor_set,
+                    &[
+                        (0, BufferView::from_allocated(ref_rgba8)),
+                        (1, BufferView::from_allocated(&ref_rgb[0])),
+                        (2, BufferView::from_allocated(&ref_rgb[1])),
+                        (3, BufferView::from_allocated(&ref_rgb[2])),
+                    ],
+                );
+                batch.record_dispatch_shader(
+                    &self.pipelines.rgba8_to_planar,
+                    descriptor_set,
+                    Some(unsafe {
+                        std::slice::from_raw_parts(
+                            &push as *const _ as *const u8,
+                            std::mem::size_of::<PushConstants>(),
+                        )
+                    }),
+                    group_count_x,
+                    group_count_y,
+                    1,
+                );
+
+                let descriptor_set = self.pipelines.rgba8_to_planar.allocate_descriptor_set()?;
+                self.pipelines.rgba8_to_planar.update_descriptor_set(
+                    descriptor_set,
+                    &[
+                        (0, BufferView::from_allocated(dist_rgba8)),
+                        (1, BufferView::from_allocated(&dist_rgb[0])),
+                        (2, BufferView::from_allocated(&dist_rgb[1])),
+                        (3, BufferView::from_allocated(&dist_rgb[2])),
+                    ],
+                );
+                batch.record_dispatch_shader(
+                    &self.pipelines.rgba8_to_planar,
+                    descriptor_set,
+                    Some(unsafe {
+                        std::slice::from_raw_parts(
+                            &push as *const _ as *const u8,
+                            std::mem::size_of::<PushConstants>(),
+                        )
+                    }),
+                    group_count_x,
+                    group_count_y,
+                    1,
+                );
+
+                Ok(())
+            }
+        }
+    }
+
     /// Compute using GPU acceleration with cached buffers
     pub fn compute_gpu(&mut self, reference: &ImageData, distorted: &ImageData) -> Result<f64> {
-        if reference.width != distorted.width || reference.height != distorted.height {
-            return Err(vship_core::error::VshipError::InvalidDimensions {
-                width: distorted.width,
-                height: distorted.height,
-            });
+        match self.compute_mode {
+            ComputeMode::SingleBatch => self.compute_gpu_single_batch(reference, distorted),
+            ComputeMode::LegacyBatched => self.compute_gpu_legacy(reference, distorted),
         }
+    }
 
-        let width = reference.width;
-        let height = reference.height;
+    /// Compute using GPU acceleration from packed RGBA8 inputs
+    pub fn compute_gpu_rgba8(
+        &mut self,
+        reference: &ImageDataRgba8,
+        distorted: &ImageDataRgba8,
+    ) -> Result<f64> {
+        match self.compute_mode {
+            ComputeMode::SingleBatch => {
+                self.compute_gpu_single_batch_inner(InputRgb::Rgba8 { reference, distorted })
+            }
+            ComputeMode::LegacyBatched => {
+                self.compute_gpu_legacy_inner(InputRgb::Rgba8 { reference, distorted })
+            }
+        }
+    }
+
+    fn compute_gpu_single_batch(&mut self, reference: &ImageData, distorted: &ImageData) -> Result<f64> {
+        self.compute_gpu_single_batch_inner(InputRgb::F32 { reference, distorted })
+    }
+
+    fn compute_gpu_single_batch_inner(&mut self, input: InputRgb<'_>) -> Result<f64> {
+        let (width, height) = Self::input_dims(&input)?;
 
         // Ensure all buffers are allocated for this resolution (reuses if same size)
         self.ensure_buffers_allocated(width, height)?;
 
         // Reset all descriptor pools at start of each frame to reuse allocations
+        self.pipelines.rgba8_to_planar.reset_descriptor_pool()?;
         self.pipelines.rgb_to_xyb.reset_descriptor_pool()?;
         self.pipelines.gaussian_blur.reset_descriptor_pool()?;
         self.pipelines.downsample.reset_descriptor_pool()?;
         self.pipelines.ssim_error.reset_descriptor_pool()?;
+        self.pipelines.reduce_sum.reset_descriptor_pool()?;
 
-        // Step 1: Convert RGB to XYB on GPU (uses cached buffers)
-        self.rgb_to_xyb_cached(reference, distorted, width, height)?;
+        self.last_frame_gpu_time_ns = 0;
 
-        // Step 2: Build pyramid by downsampling (uses cached pyramid buffers)
+        let mut batch = self.compute_ctx.begin_batch()?;
+        self.record_upload_rgb_inputs(&mut batch, &input, width, height)?;
+
+        let ref_rgb = self.cached_buffers.ref_rgb.as_ref().unwrap();
+        let dist_rgb = self.cached_buffers.dist_rgb.as_ref().unwrap();
+        let ref_xyb = self.cached_buffers.ref_xyb_scale0.as_ref().unwrap();
+        let dist_xyb = self.cached_buffers.dist_xyb_scale0.as_ref().unwrap();
+
+        #[repr(C)]
+        struct RgbToXybPush {
+            width: u32,
+            height: u32,
+        }
+        let rgb_to_xyb_push = RgbToXybPush { width, height };
+        let group_count_x = compute_dispatch_size(width, RGB_WORKGROUP_SIZE);
+        let group_count_y = compute_dispatch_size(height, RGB_WORKGROUP_SIZE);
+
+        let descriptor_set = self.pipelines.rgb_to_xyb.allocate_descriptor_set()?;
+        self.pipelines.rgb_to_xyb.update_descriptor_set(
+            descriptor_set,
+            &[
+                (0, BufferView::from_allocated(&ref_rgb[0])),
+                (1, BufferView::from_allocated(&ref_rgb[1])),
+                (2, BufferView::from_allocated(&ref_rgb[2])),
+                (3, BufferView::from_allocated(&ref_xyb.x)),
+                (4, BufferView::from_allocated(&ref_xyb.y)),
+                (5, BufferView::from_allocated(&ref_xyb.b)),
+            ],
+        );
+        batch.record_dispatch_shader(
+            &self.pipelines.rgb_to_xyb,
+            descriptor_set,
+            Some(unsafe {
+                std::slice::from_raw_parts(
+                    &rgb_to_xyb_push as *const _ as *const u8,
+                    std::mem::size_of::<RgbToXybPush>(),
+                )
+            }),
+            group_count_x,
+            group_count_y,
+            1,
+        );
+
+        let descriptor_set = self.pipelines.rgb_to_xyb.allocate_descriptor_set()?;
+        self.pipelines.rgb_to_xyb.update_descriptor_set(
+            descriptor_set,
+            &[
+                (0, BufferView::from_allocated(&dist_rgb[0])),
+                (1, BufferView::from_allocated(&dist_rgb[1])),
+                (2, BufferView::from_allocated(&dist_rgb[2])),
+                (3, BufferView::from_allocated(&dist_xyb.x)),
+                (4, BufferView::from_allocated(&dist_xyb.y)),
+                (5, BufferView::from_allocated(&dist_xyb.b)),
+            ],
+        );
+        batch.record_dispatch_shader(
+            &self.pipelines.rgb_to_xyb,
+            descriptor_set,
+            Some(unsafe {
+                std::slice::from_raw_parts(
+                    &rgb_to_xyb_push as *const _ as *const u8,
+                    std::mem::size_of::<RgbToXybPush>(),
+                )
+            }),
+            group_count_x,
+            group_count_y,
+            1,
+        );
+
+        // Build pyramid by downsampling
         for scale in 1..NUM_SCALES {
             let prev_width = width / (1 << (scale - 1));
             let prev_height = height / (1 << (scale - 1));
             let curr_width = width / (1 << scale);
             let curr_height = height / (1 << scale);
 
-            self.downsample_cached(scale, prev_width, prev_height, curr_width, curr_height)?;
+            #[repr(C)]
+            struct DownsamplePush {
+                input_width: u32,
+                input_height: u32,
+                output_width: u32,
+                output_height: u32,
+            }
+            let push_constants = DownsamplePush {
+                input_width: prev_width,
+                input_height: prev_height,
+                output_width: curr_width,
+                output_height: curr_height,
+            };
+            let group_count_x = compute_dispatch_size(curr_width, 16);
+            let group_count_y = compute_dispatch_size(curr_height, 16);
+
+            let (ref_input, dist_input) = if scale == 1 {
+                (
+                    self.cached_buffers.ref_xyb_scale0.as_ref().unwrap(),
+                    self.cached_buffers.dist_xyb_scale0.as_ref().unwrap(),
+                )
+            } else {
+                let ref_pyr = self.cached_buffers.ref_pyramid.as_ref().unwrap();
+                let dist_pyr = self.cached_buffers.dist_pyramid.as_ref().unwrap();
+                (&ref_pyr[scale - 2], &dist_pyr[scale - 2])
+            };
+
+            let ref_output = &self.cached_buffers.ref_pyramid.as_ref().unwrap()[scale - 1];
+            let dist_output = &self.cached_buffers.dist_pyramid.as_ref().unwrap()[scale - 1];
+
+            for (input_ch, output_ch) in [
+                (&ref_input.x, &ref_output.x),
+                (&ref_input.y, &ref_output.y),
+                (&ref_input.b, &ref_output.b),
+                (&dist_input.x, &dist_output.x),
+                (&dist_input.y, &dist_output.y),
+                (&dist_input.b, &dist_output.b),
+            ] {
+                let descriptor_set = self.pipelines.downsample.allocate_descriptor_set()?;
+                self.pipelines.downsample.update_descriptor_set(
+                    descriptor_set,
+                    &[
+                        (0, BufferView::from_allocated(input_ch)),
+                        (1, BufferView::from_allocated(output_ch)),
+                    ],
+                );
+                batch.record_dispatch_shader(
+                    &self.pipelines.downsample,
+                    descriptor_set,
+                    Some(unsafe {
+                        std::slice::from_raw_parts(
+                            &push_constants as *const _ as *const u8,
+                            std::mem::size_of::<DownsamplePush>(),
+                        )
+                    }),
+                    group_count_x,
+                    group_count_y,
+                    1,
+                );
+            }
         }
 
-        // Step 3: Multi-scale processing
-        let mut total_error = 0.0;
-        let mut total_weight = 0.0;
-
+        // Gaussian blur across scales
         for scale in 0..NUM_SCALES {
             let scale_width = width / (1 << scale);
             let scale_height = height / (1 << scale);
             let sigma = self.config.blur_sigmas[scale];
 
-            // Apply Gaussian blur to get local means (uses cached blur buffers)
-            self.gaussian_blur_cached(scale, scale_width, scale_height, sigma)?;
+            let gaussian = GaussianKernel::new(sigma);
+            let kernel_radius = gaussian.radius as u32;
 
-            // Compute SSIM error for this scale (uses cached error buffers)
-            let scale_error = self.compute_error_cached(scale, scale_width, scale_height)?;
+            if (self.last_kernel_sigma - sigma).abs() > 1e-6 || self.kernel_buffer.is_none() {
+                let allocator = self.compute_ctx.allocator();
+                let kernel_size = (gaussian.kernel.len() * std::mem::size_of::<f32>()) as u64;
+                let new_kernel_buf = allocator.create_device_buffer(kernel_size, BufferUsage::STORAGE)?;
+                batch.record_upload_buffer(&gaussian.kernel, &new_kernel_buf)?;
+                self.kernel_buffer = Some(new_kernel_buf);
+                self.last_kernel_sigma = sigma;
+                batch.record_transfer_to_compute_barrier();
+            }
 
+            #[repr(C)]
+            struct BlurPush {
+                width: u32,
+                height: u32,
+                kernel_radius: u32,
+                is_vertical: u32,
+            }
+
+            let pixel_count = scale_width * scale_height;
+            let group_count = compute_dispatch_size(pixel_count, 256);
+
+            let (ref_input, dist_input) = if scale == 0 {
+                (
+                    self.cached_buffers.ref_xyb_scale0.as_ref().unwrap(),
+                    self.cached_buffers.dist_xyb_scale0.as_ref().unwrap(),
+                )
+            } else {
+                let ref_pyr = self.cached_buffers.ref_pyramid.as_ref().unwrap();
+                let dist_pyr = self.cached_buffers.dist_pyramid.as_ref().unwrap();
+                (&ref_pyr[scale - 1], &dist_pyr[scale - 1])
+            };
+
+            let ref_blurred = &self.cached_buffers.ref_blurred.as_ref().unwrap()[scale];
+            let dist_blurred = &self.cached_buffers.dist_blurred.as_ref().unwrap()[scale];
+            let temp_buf = self.cached_buffers.blur_temp.as_ref().unwrap();
+            let kernel_buf = self.kernel_buffer.as_ref().unwrap();
+
+            for (input_ch, output_ch) in [
+                (&ref_input.x, &ref_blurred.x),
+                (&ref_input.y, &ref_blurred.y),
+                (&ref_input.b, &ref_blurred.b),
+                (&dist_input.x, &dist_blurred.x),
+                (&dist_input.y, &dist_blurred.y),
+                (&dist_input.b, &dist_blurred.b),
+            ] {
+                let push_h = BlurPush { width: scale_width, height: scale_height, kernel_radius, is_vertical: 0 };
+                let desc_h = self.pipelines.gaussian_blur.allocate_descriptor_set()?;
+                self.pipelines.gaussian_blur.update_descriptor_set(
+                    desc_h,
+                    &[
+                        (0, BufferView::from_allocated(input_ch)),
+                        (1, BufferView::from_allocated(temp_buf)),
+                        (2, BufferView::from_allocated(kernel_buf)),
+                    ],
+                );
+                batch.record_dispatch_shader(
+                    &self.pipelines.gaussian_blur,
+                    desc_h,
+                    Some(unsafe { std::slice::from_raw_parts(&push_h as *const _ as *const u8, std::mem::size_of::<BlurPush>()) }),
+                    group_count, 1, 1,
+                );
+
+                let push_v = BlurPush { width: scale_width, height: scale_height, kernel_radius, is_vertical: 1 };
+                let desc_v = self.pipelines.gaussian_blur.allocate_descriptor_set()?;
+                self.pipelines.gaussian_blur.update_descriptor_set(
+                    desc_v,
+                    &[
+                        (0, BufferView::from_allocated(temp_buf)),
+                        (1, BufferView::from_allocated(output_ch)),
+                        (2, BufferView::from_allocated(kernel_buf)),
+                    ],
+                );
+                batch.record_dispatch_shader(
+                    &self.pipelines.gaussian_blur,
+                    desc_v,
+                    Some(unsafe { std::slice::from_raw_parts(&push_v as *const _ as *const u8, std::mem::size_of::<BlurPush>()) }),
+                    group_count, 1, 1,
+                );
+            }
+        }
+
+        // SSIM error dispatches + reductions
+        enum Readback {
+            Reduced { scale: usize, channel: usize, buffer: AllocatedBuffer, pixels: usize },
+            Full { scale: usize, channel: usize, buffer: AllocatedBuffer, pixels: usize },
+        }
+
+        let mut readbacks: Vec<Readback> = Vec::with_capacity(NUM_SCALES * 3);
+        let error_bufs = self.cached_buffers.error_buffers.as_ref().unwrap();
+
+        for scale in 0..NUM_SCALES {
+            let scale_width = width / (1 << scale);
+            let scale_height = height / (1 << scale);
+            let scale_pixels = (scale_width * scale_height) as usize;
+            let error_buffer_size = (scale_pixels * std::mem::size_of::<f32>()) as u64;
+            const C1: f32 = 0.01 * 0.01;
+            const C2: f32 = 0.03 * 0.03;
+
+            #[repr(C)]
+            struct ErrorPush {
+                width: u32,
+                height: u32,
+                c1: f32,
+                c2: f32,
+            }
+            let push_constants = ErrorPush {
+                width: scale_width,
+                height: scale_height,
+                c1: C1,
+                c2: C2,
+            };
+            let group_count = compute_dispatch_size(scale_width * scale_height, 256);
+
+            let (ref_orig, dist_orig) = if scale == 0 {
+                (
+                    self.cached_buffers.ref_xyb_scale0.as_ref().unwrap(),
+                    self.cached_buffers.dist_xyb_scale0.as_ref().unwrap(),
+                )
+            } else {
+                let ref_pyr = self.cached_buffers.ref_pyramid.as_ref().unwrap();
+                let dist_pyr = self.cached_buffers.dist_pyramid.as_ref().unwrap();
+                (&ref_pyr[scale - 1], &dist_pyr[scale - 1])
+            };
+
+            let ref_blurred = &self.cached_buffers.ref_blurred.as_ref().unwrap()[scale];
+            let dist_blurred = &self.cached_buffers.dist_blurred.as_ref().unwrap()[scale];
+
+            let channels = [
+                (&ref_orig.x, &dist_orig.x, &ref_blurred.x, &dist_blurred.x, &error_bufs[0], 0usize),
+                (&ref_orig.y, &dist_orig.y, &ref_blurred.y, &dist_blurred.y, &error_bufs[1], 1usize),
+                (&ref_orig.b, &dist_orig.b, &ref_blurred.b, &dist_blurred.b, &error_bufs[2], 2usize),
+            ];
+
+            for (orig_ref, orig_dist, blur_ref, blur_dist, error_buf, channel) in channels {
+                let descriptor_set = self.pipelines.ssim_error.allocate_descriptor_set()?;
+                self.pipelines.ssim_error.update_descriptor_set(
+                    descriptor_set,
+                    &[
+                        (0, BufferView::from_allocated(orig_ref)),
+                        (1, BufferView::from_allocated(orig_dist)),
+                        (2, BufferView::from_allocated(blur_ref)),
+                        (3, BufferView::from_allocated(blur_dist)),
+                        (4, BufferView::from_allocated(error_buf)),
+                    ],
+                );
+                batch.record_dispatch_shader(
+                    &self.pipelines.ssim_error,
+                    descriptor_set,
+                    Some(unsafe {
+                        std::slice::from_raw_parts(
+                            &push_constants as *const _ as *const u8,
+                            std::mem::size_of::<ErrorPush>(),
+                        )
+                    }),
+                    group_count,
+                    1,
+                    1,
+                );
+                let readback = match self.reduce_mode {
+                    ReduceMode::Gpu => Readback::Reduced {
+                        scale,
+                        channel,
+                        buffer: self.record_reduce_sum(&mut batch, error_buf, scale_pixels as u32)?,
+                        pixels: scale_pixels,
+                    },
+                    ReduceMode::Cpu => Readback::Full {
+                        scale,
+                        channel,
+                        buffer: batch.record_download_buffer(error_buf, error_buffer_size)?,
+                        pixels: scale_pixels,
+                    },
+                };
+                readbacks.push(readback);
+            }
+        }
+
+        self.last_frame_gpu_time_ns = batch.finish_and_wait()?;
+
+        let mut scale_channel_errors = vec![[0.0f64; 3]; NUM_SCALES];
+        for readback in readbacks {
+            match readback {
+                Readback::Reduced { scale, channel, mut buffer, pixels } => {
+                    let mut sum = [0.0f32; 1];
+                    buffer.read_data(&mut sum)?;
+                    scale_channel_errors[scale][channel] = (sum[0] / pixels as f32) as f64;
+                }
+                Readback::Full { scale, channel, mut buffer, pixels } => {
+                    let mut errors = vec![0.0f32; pixels];
+                    buffer.read_data(&mut errors)?;
+                    let sum: f32 = errors.iter().sum();
+                    scale_channel_errors[scale][channel] = (sum / pixels as f32) as f64;
+                }
+            }
+        }
+
+        let mut total_error = 0.0;
+        let mut total_weight = 0.0;
+        for scale in 0..NUM_SCALES {
+            let channel_errors = scale_channel_errors[scale];
+            let scale_error = 0.2 * channel_errors[0] + 0.6 * channel_errors[1] + 0.2 * channel_errors[2];
             let weight = self.config.edge_weights[scale] + self.config.detail_weights[scale];
             total_error += scale_error * weight as f64;
             total_weight += weight as f64;
@@ -346,34 +892,127 @@ impl Ssimulacra2Gpu {
             0.0
         };
 
-        // Convert perceptual error to SSIMULACRA2-like score
-        // Based on observed error values:
-        // - Typical x265 high-quality encode: error ~0.0003-0.0007
-        // - These should map to scores around 80-95
-        //
-        // SSIMULACRA2 score mapping:
-        // - 90+: excellent (imperceptible differences)
-        // - 70-90: good (barely perceptible)
-        // - 50-70: fair (perceptible but acceptable)
-        // - 30-50: poor (clearly visible artifacts)
-        // - <30: bad (severe artifacts)
-
-        let score = if mean_error < 1e-10 {
-            100.0  // Essentially identical
-        } else {
-            // Empirical mapping based on observed XYB error magnitudes
-            // Error 0.0001 -> ~95, Error 0.001 -> ~80, Error 0.01 -> ~50, Error 0.1 -> ~20
-            // Using: score = 100 - k * sqrt(error) where k scales the error appropriately
-            // With k = 3000: error 0.0001 -> 100-30 = 70, error 0.001 -> 100-95 = 5 (too harsh)
-            // Let's use exponential decay: score = 100 * exp(-k * error)
-            // With k = 100: error 0.001 -> 100 * 0.905 = 90.5
-            // With k = 500: error 0.001 -> 100 * 0.607 = 60.7
-            // With k = 200: error 0.001 -> 100 * 0.819 = 81.9, error 0.0005 -> 100 * 0.905 = 90.5
-            let score = 100.0 * (-200.0 * mean_error).exp();
-            score.max(0.0).min(100.0)
-        };
+        let score = Self::score_from_mean_error(mean_error);
 
         Ok(score)
+    }
+
+    fn compute_gpu_legacy(&mut self, reference: &ImageData, distorted: &ImageData) -> Result<f64> {
+        self.compute_gpu_legacy_inner(InputRgb::F32 { reference, distorted })
+    }
+
+    fn compute_gpu_legacy_inner(&mut self, input: InputRgb<'_>) -> Result<f64> {
+        let (width, height) = Self::input_dims(&input)?;
+
+        self.ensure_buffers_allocated(width, height)?;
+        self.pipelines.rgba8_to_planar.reset_descriptor_pool()?;
+        self.pipelines.rgb_to_xyb.reset_descriptor_pool()?;
+        self.pipelines.gaussian_blur.reset_descriptor_pool()?;
+        self.pipelines.downsample.reset_descriptor_pool()?;
+        self.pipelines.ssim_error.reset_descriptor_pool()?;
+        self.pipelines.reduce_sum.reset_descriptor_pool()?;
+
+        let mut gpu_time_ns = 0u64;
+
+        self.rgb_to_xyb_cached(&input, width, height)?;
+        gpu_time_ns += self.compute_ctx.last_gpu_time_ns();
+
+        for scale in 1..NUM_SCALES {
+            let prev_width = width / (1 << (scale - 1));
+            let prev_height = height / (1 << (scale - 1));
+            let curr_width = width / (1 << scale);
+            let curr_height = height / (1 << scale);
+
+            self.downsample_cached(scale, prev_width, prev_height, curr_width, curr_height)?;
+            gpu_time_ns += self.compute_ctx.last_gpu_time_ns();
+        }
+
+        let mut total_error = 0.0;
+        let mut total_weight = 0.0;
+
+        for scale in 0..NUM_SCALES {
+            let scale_width = width / (1 << scale);
+            let scale_height = height / (1 << scale);
+            let sigma = self.config.blur_sigmas[scale];
+
+            self.gaussian_blur_cached(scale, scale_width, scale_height, sigma)?;
+            gpu_time_ns += self.compute_ctx.last_gpu_time_ns();
+
+            let scale_error = self.compute_error_cached(scale, scale_width, scale_height)?;
+            gpu_time_ns += self.compute_ctx.last_gpu_time_ns();
+
+            let weight = self.config.edge_weights[scale] + self.config.detail_weights[scale];
+            total_error += scale_error * weight as f64;
+            total_weight += weight as f64;
+        }
+
+        self.last_frame_gpu_time_ns = gpu_time_ns;
+
+        let mean_error = if total_weight > 0.0 {
+            total_error / total_weight
+        } else {
+            0.0
+        };
+
+        Ok(Self::score_from_mean_error(mean_error))
+    }
+
+    fn record_reduce_sum(
+        &self,
+        batch: &mut ComputeBatch<'_>,
+        input: &AllocatedBuffer,
+        element_count: u32,
+    ) -> Result<AllocatedBuffer> {
+        #[repr(C)]
+        struct PushConstants {
+            element_count: u32,
+        }
+
+        let scratch_a = self.cached_buffers.reduce_scratch_a.as_ref().unwrap();
+        let scratch_b = self.cached_buffers.reduce_scratch_b.as_ref().unwrap();
+
+        let mut current_input = input;
+        let mut current_count = element_count;
+        let mut use_a = true;
+
+        loop {
+            let group_count = compute_dispatch_size(current_count, REDUCE_GROUP_SIZE);
+            let push_constants = PushConstants {
+                element_count: current_count,
+            };
+
+            let output = if use_a { scratch_a } else { scratch_b };
+
+            let descriptor_set = self.pipelines.reduce_sum.allocate_descriptor_set()?;
+            self.pipelines.reduce_sum.update_descriptor_set(
+                descriptor_set,
+                &[
+                    (0, BufferView::from_allocated(current_input)),
+                    (1, BufferView::from_allocated(output)),
+                ],
+            );
+            batch.record_dispatch_shader(
+                &self.pipelines.reduce_sum,
+                descriptor_set,
+                Some(unsafe {
+                    std::slice::from_raw_parts(
+                        &push_constants as *const _ as *const u8,
+                        std::mem::size_of::<PushConstants>(),
+                    )
+                }),
+                group_count,
+                1,
+                1,
+            );
+
+            if group_count == 1 {
+                return batch.record_download_buffer(output, std::mem::size_of::<f32>() as u64);
+            }
+
+            current_input = output;
+            current_count = group_count;
+            use_a = !use_a;
+        }
     }
 
     // ========== CACHED BUFFER METHODS ==========
@@ -381,12 +1020,10 @@ impl Ssimulacra2Gpu {
     /// Convert RGB to XYB using cached buffers
     fn rgb_to_xyb_cached(
         &mut self,
-        reference: &ImageData,
-        distorted: &ImageData,
+        input: &InputRgb<'_>,
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let pixel_count = (width * height) as usize;
 
         // Push constants
         #[repr(C)]
@@ -395,84 +1032,70 @@ impl Ssimulacra2Gpu {
             height: u32,
         }
         let push_constants = PushConstants { width, height };
-        let group_count_x = compute_dispatch_size(width, 16);
-        let group_count_y = compute_dispatch_size(height, 16);
+        let group_count_x = compute_dispatch_size(width, RGB_WORKGROUP_SIZE);
+        let group_count_y = compute_dispatch_size(height, RGB_WORKGROUP_SIZE);
 
-        // Upload reference RGB to cached buffers and run shader
-        {
-            let ref_rgb = self.cached_buffers.ref_rgb.as_ref().unwrap();
-            let ref_xyb = self.cached_buffers.ref_xyb_scale0.as_ref().unwrap();
+        let mut batch = self.compute_ctx.begin_batch()?;
+        self.record_upload_rgb_inputs(&mut batch, input, width, height)?;
 
-            // Upload RGB channels
-            self.compute_ctx.upload_buffer(&reference.data[0..pixel_count], &ref_rgb[0])?;
-            self.compute_ctx.upload_buffer(&reference.data[pixel_count..2 * pixel_count], &ref_rgb[1])?;
-            self.compute_ctx.upload_buffer(&reference.data[2 * pixel_count..3 * pixel_count], &ref_rgb[2])?;
+        let ref_rgb = self.cached_buffers.ref_rgb.as_ref().unwrap();
+        let dist_rgb = self.cached_buffers.dist_rgb.as_ref().unwrap();
+        let ref_xyb = self.cached_buffers.ref_xyb_scale0.as_ref().unwrap();
+        let dist_xyb = self.cached_buffers.dist_xyb_scale0.as_ref().unwrap();
 
-            // Dispatch RGB->XYB shader
-            let descriptor_set = self.pipelines.rgb_to_xyb.allocate_descriptor_set()?;
-            self.pipelines.rgb_to_xyb.update_descriptor_set(
-                descriptor_set,
-                &[
-                    (0, BufferView::from_allocated(&ref_rgb[0])),
-                    (1, BufferView::from_allocated(&ref_rgb[1])),
-                    (2, BufferView::from_allocated(&ref_rgb[2])),
-                    (3, BufferView::from_allocated(&ref_xyb.x)),
-                    (4, BufferView::from_allocated(&ref_xyb.y)),
-                    (5, BufferView::from_allocated(&ref_xyb.b)),
-                ],
-            );
-            self.compute_ctx.dispatch_shader(
-                &self.pipelines.rgb_to_xyb,
-                descriptor_set,
-                Some(unsafe {
-                    std::slice::from_raw_parts(
-                        &push_constants as *const _ as *const u8,
-                        std::mem::size_of::<PushConstants>(),
-                    )
-                }),
-                group_count_x,
-                group_count_y,
-                1,
-            )?;
-        }
+        let descriptor_set = self.pipelines.rgb_to_xyb.allocate_descriptor_set()?;
+        self.pipelines.rgb_to_xyb.update_descriptor_set(
+            descriptor_set,
+            &[
+                (0, BufferView::from_allocated(&ref_rgb[0])),
+                (1, BufferView::from_allocated(&ref_rgb[1])),
+                (2, BufferView::from_allocated(&ref_rgb[2])),
+                (3, BufferView::from_allocated(&ref_xyb.x)),
+                (4, BufferView::from_allocated(&ref_xyb.y)),
+                (5, BufferView::from_allocated(&ref_xyb.b)),
+            ],
+        );
+        batch.record_dispatch_shader(
+            &self.pipelines.rgb_to_xyb,
+            descriptor_set,
+            Some(unsafe {
+                std::slice::from_raw_parts(
+                    &push_constants as *const _ as *const u8,
+                    std::mem::size_of::<PushConstants>(),
+                )
+            }),
+            group_count_x,
+            group_count_y,
+            1,
+        );
 
-        // Upload distorted RGB to cached buffers and run shader
-        {
-            let dist_rgb = self.cached_buffers.dist_rgb.as_ref().unwrap();
-            let dist_xyb = self.cached_buffers.dist_xyb_scale0.as_ref().unwrap();
+        let descriptor_set = self.pipelines.rgb_to_xyb.allocate_descriptor_set()?;
+        self.pipelines.rgb_to_xyb.update_descriptor_set(
+            descriptor_set,
+            &[
+                (0, BufferView::from_allocated(&dist_rgb[0])),
+                (1, BufferView::from_allocated(&dist_rgb[1])),
+                (2, BufferView::from_allocated(&dist_rgb[2])),
+                (3, BufferView::from_allocated(&dist_xyb.x)),
+                (4, BufferView::from_allocated(&dist_xyb.y)),
+                (5, BufferView::from_allocated(&dist_xyb.b)),
+            ],
+        );
+        batch.record_dispatch_shader(
+            &self.pipelines.rgb_to_xyb,
+            descriptor_set,
+            Some(unsafe {
+                std::slice::from_raw_parts(
+                    &push_constants as *const _ as *const u8,
+                    std::mem::size_of::<PushConstants>(),
+                )
+            }),
+            group_count_x,
+            group_count_y,
+            1,
+        );
 
-            // Upload RGB channels
-            self.compute_ctx.upload_buffer(&distorted.data[0..pixel_count], &dist_rgb[0])?;
-            self.compute_ctx.upload_buffer(&distorted.data[pixel_count..2 * pixel_count], &dist_rgb[1])?;
-            self.compute_ctx.upload_buffer(&distorted.data[2 * pixel_count..3 * pixel_count], &dist_rgb[2])?;
-
-            // Dispatch RGB->XYB shader
-            let descriptor_set = self.pipelines.rgb_to_xyb.allocate_descriptor_set()?;
-            self.pipelines.rgb_to_xyb.update_descriptor_set(
-                descriptor_set,
-                &[
-                    (0, BufferView::from_allocated(&dist_rgb[0])),
-                    (1, BufferView::from_allocated(&dist_rgb[1])),
-                    (2, BufferView::from_allocated(&dist_rgb[2])),
-                    (3, BufferView::from_allocated(&dist_xyb.x)),
-                    (4, BufferView::from_allocated(&dist_xyb.y)),
-                    (5, BufferView::from_allocated(&dist_xyb.b)),
-                ],
-            );
-            self.compute_ctx.dispatch_shader(
-                &self.pipelines.rgb_to_xyb,
-                descriptor_set,
-                Some(unsafe {
-                    std::slice::from_raw_parts(
-                        &push_constants as *const _ as *const u8,
-                        std::mem::size_of::<PushConstants>(),
-                    )
-                }),
-                group_count_x,
-                group_count_y,
-                1,
-            )?;
-        }
+        let _ = batch.finish_and_wait()?;
 
         Ok(())
     }
@@ -518,6 +1141,8 @@ impl Ssimulacra2Gpu {
         let ref_output = &self.cached_buffers.ref_pyramid.as_ref().unwrap()[scale - 1];
         let dist_output = &self.cached_buffers.dist_pyramid.as_ref().unwrap()[scale - 1];
 
+        let mut batch = self.compute_ctx.begin_batch()?;
+
         // Downsample reference XYB channels
         for (input_ch, output_ch) in [
             (&ref_input.x, &ref_output.x),
@@ -532,7 +1157,7 @@ impl Ssimulacra2Gpu {
                     (1, BufferView::from_allocated(output_ch)),
                 ],
             );
-            self.compute_ctx.dispatch_shader(
+            batch.record_dispatch_shader(
                 &self.pipelines.downsample,
                 descriptor_set,
                 Some(unsafe {
@@ -544,7 +1169,7 @@ impl Ssimulacra2Gpu {
                 group_count_x,
                 group_count_y,
                 1,
-            )?;
+            );
         }
 
         // Downsample distorted XYB channels
@@ -561,7 +1186,7 @@ impl Ssimulacra2Gpu {
                     (1, BufferView::from_allocated(output_ch)),
                 ],
             );
-            self.compute_ctx.dispatch_shader(
+            batch.record_dispatch_shader(
                 &self.pipelines.downsample,
                 descriptor_set,
                 Some(unsafe {
@@ -573,8 +1198,10 @@ impl Ssimulacra2Gpu {
                 group_count_x,
                 group_count_y,
                 1,
-            )?;
+            );
         }
+
+        let _ = batch.finish_and_wait()?;
 
         Ok(())
     }
@@ -629,6 +1256,8 @@ impl Ssimulacra2Gpu {
         let temp_buf = self.cached_buffers.blur_temp.as_ref().unwrap();
         let kernel_buf = self.kernel_buffer.as_ref().unwrap();
 
+        let mut batch = self.compute_ctx.begin_batch()?;
+
         // Blur reference channels (X, Y, B)
         for (input_ch, output_ch) in [
             (&ref_input.x, &ref_blurred.x),
@@ -646,12 +1275,12 @@ impl Ssimulacra2Gpu {
                     (2, BufferView::from_allocated(kernel_buf)),
                 ],
             );
-            self.compute_ctx.dispatch_shader(
+            batch.record_dispatch_shader(
                 &self.pipelines.gaussian_blur,
                 desc_h,
                 Some(unsafe { std::slice::from_raw_parts(&push_h as *const _ as *const u8, std::mem::size_of::<PushConstants>()) }),
                 group_count, 1, 1,
-            )?;
+            );
 
             // Vertical pass
             let push_v = PushConstants { width, height, kernel_radius, is_vertical: 1 };
@@ -664,12 +1293,12 @@ impl Ssimulacra2Gpu {
                     (2, BufferView::from_allocated(kernel_buf)),
                 ],
             );
-            self.compute_ctx.dispatch_shader(
+            batch.record_dispatch_shader(
                 &self.pipelines.gaussian_blur,
                 desc_v,
                 Some(unsafe { std::slice::from_raw_parts(&push_v as *const _ as *const u8, std::mem::size_of::<PushConstants>()) }),
                 group_count, 1, 1,
-            )?;
+            );
         }
 
         // Blur distorted channels
@@ -689,12 +1318,12 @@ impl Ssimulacra2Gpu {
                     (2, BufferView::from_allocated(kernel_buf)),
                 ],
             );
-            self.compute_ctx.dispatch_shader(
+            batch.record_dispatch_shader(
                 &self.pipelines.gaussian_blur,
                 desc_h,
                 Some(unsafe { std::slice::from_raw_parts(&push_h as *const _ as *const u8, std::mem::size_of::<PushConstants>()) }),
                 group_count, 1, 1,
-            )?;
+            );
 
             // Vertical pass
             let push_v = PushConstants { width, height, kernel_radius, is_vertical: 1 };
@@ -707,13 +1336,15 @@ impl Ssimulacra2Gpu {
                     (2, BufferView::from_allocated(kernel_buf)),
                 ],
             );
-            self.compute_ctx.dispatch_shader(
+            batch.record_dispatch_shader(
                 &self.pipelines.gaussian_blur,
                 desc_v,
                 Some(unsafe { std::slice::from_raw_parts(&push_v as *const _ as *const u8, std::mem::size_of::<PushConstants>()) }),
                 group_count, 1, 1,
-            )?;
+            );
         }
+
+        let _ = batch.finish_and_wait()?;
 
         Ok(())
     }
@@ -726,6 +1357,7 @@ impl Ssimulacra2Gpu {
         height: u32,
     ) -> Result<f64> {
         let pixel_count = (width * height) as usize;
+        let error_buffer_size = (pixel_count * std::mem::size_of::<f32>()) as u64;
 
         const C1: f32 = 0.01 * 0.01;
         const C2: f32 = 0.03 * 0.03;
@@ -764,8 +1396,10 @@ impl Ssimulacra2Gpu {
         ];
 
         let mut channel_errors = [0.0f64; 3];
+        let mut readbacks = Vec::with_capacity(3);
+        let mut batch = self.compute_ctx.begin_batch()?;
 
-        for (i, (orig_ref, orig_dist, blur_ref, blur_dist, error_buf)) in channels.iter().enumerate() {
+        for (orig_ref, orig_dist, blur_ref, blur_dist, error_buf) in channels.iter() {
             let descriptor_set = self.pipelines.ssim_error.allocate_descriptor_set()?;
             self.pipelines.ssim_error.update_descriptor_set(
                 descriptor_set,
@@ -777,7 +1411,7 @@ impl Ssimulacra2Gpu {
                     (4, BufferView::from_allocated(*error_buf)),
                 ],
             );
-            self.compute_ctx.dispatch_shader(
+            batch.record_dispatch_shader(
                 &self.pipelines.ssim_error,
                 descriptor_set,
                 Some(unsafe {
@@ -789,11 +1423,16 @@ impl Ssimulacra2Gpu {
                 group_count,
                 1,
                 1,
-            )?;
+            );
 
-            // Download and compute mean
-            let mut errors = vec![0.0f32; pixel_count];
-            self.compute_ctx.download_buffer(*error_buf, &mut errors)?;
+            readbacks.push(batch.record_download_buffer(*error_buf, error_buffer_size)?);
+        }
+
+        let _ = batch.finish_and_wait()?;
+
+        let mut errors = vec![0.0f32; pixel_count];
+        for (i, mut readback) in readbacks.into_iter().enumerate() {
+            readback.read_data(&mut errors)?;
             let sum: f32 = errors.iter().sum();
             channel_errors[i] = (sum / pixel_count as f32) as f64;
         }
@@ -1266,12 +1905,32 @@ impl Metric for Ssimulacra2Gpu {
         self.compute_gpu(reference, distorted)
     }
 
+    fn compute_rgba8(
+        &mut self,
+        reference: &ImageDataRgba8,
+        distorted: &ImageDataRgba8,
+    ) -> Result<f64> {
+        self.compute_gpu_rgba8(reference, distorted)
+    }
+
     fn name(&self) -> &str {
         "SSIMULACRA2-GPU"
     }
 
     fn reset(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn gpu_time_ns(&self) -> Option<u64> {
+        Some(self.last_frame_gpu_time_ns)
+    }
+
+    fn set_compute_mode(&mut self, mode: ComputeMode) {
+        self.compute_mode = mode;
+    }
+
+    fn set_reduce_mode(&mut self, mode: ReduceMode) {
+        self.reduce_mode = mode;
     }
 }
 

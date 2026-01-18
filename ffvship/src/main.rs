@@ -7,7 +7,11 @@ mod ffmpeg_decoder;
 
 use clap::{Parser, ValueEnum};
 use anyhow::{Result, Context};
-use vship_metrics::{MetricsContext, Metric};
+use vship_metrics::{ComputeMode, ReduceMode, ImageData, ImageDataRgba8, MetricsContext, Metric};
+use std::sync::mpsc::{self, SyncSender, Receiver};
+use std::cell::Cell;
+use std::thread;
+use std::time::Instant;
 use std::path::PathBuf;
 use video::VideoReader;
 
@@ -19,6 +23,48 @@ enum MetricType {
     Butteraugli,
     /// CVVDP metric
     Cvvdp,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GpuMode {
+    /// Single command buffer per frame
+    Single,
+    /// Per-step batches with waits
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ReduceModeCli {
+    /// Reduce on GPU and read back a single value
+    Gpu,
+    /// Read back full buffer and reduce on CPU
+    Cpu,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum InputFormat {
+    /// Packed RGBA8 with GPU normalization
+    Rgba8,
+    /// Convert to planar f32 on CPU (legacy)
+    F32,
+}
+
+impl From<ReduceModeCli> for ReduceMode {
+    fn from(mode: ReduceModeCli) -> Self {
+        match mode {
+            ReduceModeCli::Gpu => ReduceMode::Gpu,
+            ReduceModeCli::Cpu => ReduceMode::Cpu,
+        }
+    }
+}
+
+impl From<GpuMode> for ComputeMode {
+    fn from(mode: GpuMode) -> Self {
+        match mode {
+            GpuMode::Single => ComputeMode::SingleBatch,
+            GpuMode::Legacy => ComputeMode::LegacyBatched,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -61,6 +107,141 @@ struct Cli {
     /// GPU device index
     #[arg(long, default_value = "0")]
     device: usize,
+
+    /// GPU compute mode
+    #[arg(long, value_enum, default_value = "single")]
+    gpu_mode: GpuMode,
+
+    /// Number of frames to keep in flight
+    #[arg(long, default_value = "1")]
+    in_flight: usize,
+
+    /// Max in-flight frames when adaptive mode is enabled (in_flight=0)
+    #[arg(long, default_value = "4")]
+    in_flight_max: usize,
+
+    /// Reduction mode
+    #[arg(long, value_enum, default_value = "gpu")]
+    reduce_mode: ReduceModeCli,
+
+    /// Input pixel format for comparison
+    #[arg(long, value_enum, default_value = "rgba8")]
+    input_format: InputFormat,
+}
+
+struct Job {
+    frame_num: usize,
+    ref_frame: ImageDataRgba8,
+    dist_frame: ImageDataRgba8,
+}
+
+struct JobResult {
+    frame_num: usize,
+    score: Option<f64>,
+    gpu_time_ns: u64,
+    wall_ns: u64,
+    error: Option<String>,
+}
+
+fn create_metric_instance(
+    ctx: &MetricsContext,
+    metric: MetricType,
+    gpu_mode: GpuMode,
+    reduce_mode: ReduceModeCli,
+) -> Result<Box<dyn Metric>> {
+    let mut metric: Box<dyn Metric> = match metric {
+        MetricType::Ssimulacra2 => Box::new(ctx.create_ssimulacra2()?),
+        MetricType::Butteraugli => Box::new(ctx.create_butteraugli()?),
+        MetricType::Cvvdp => Box::new(ctx.create_cvvdp()?),
+    };
+    metric.set_compute_mode(gpu_mode.into());
+    metric.set_reduce_mode(reduce_mode.into());
+    Ok(metric)
+}
+
+fn spawn_workers(
+    ctx: std::sync::Arc<MetricsContext>,
+    metric: MetricType,
+    gpu_mode: GpuMode,
+    reduce_mode: ReduceModeCli,
+    input_format: InputFormat,
+    count: usize,
+) -> (Vec<SyncSender<Job>>, Receiver<JobResult>) {
+    let (result_tx, result_rx) = mpsc::channel::<JobResult>();
+    let mut senders = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        let result_tx = result_tx.clone();
+        let metric_type = metric;
+        let gpu_mode = gpu_mode;
+        let input_format = input_format;
+        let ctx = std::sync::Arc::clone(&ctx);
+
+        thread::spawn(move || {
+            let mut metric = match create_metric_instance(&ctx, metric_type, gpu_mode, reduce_mode) {
+                Ok(metric) => metric,
+                Err(err) => {
+                    let _ = result_tx.send(JobResult {
+                        frame_num: 0,
+                        score: None,
+                        gpu_time_ns: 0,
+                        wall_ns: 0,
+                        error: Some(err.to_string()),
+                    });
+                    return;
+                }
+            };
+
+            for job in job_rx {
+                let start = Instant::now();
+                let score = match input_format {
+                    InputFormat::Rgba8 => metric.compute_rgba8(&job.ref_frame, &job.dist_frame),
+                    InputFormat::F32 => {
+                        let ref_f32 = ImageData::from_rgba8(
+                            job.ref_frame.width,
+                            job.ref_frame.height,
+                            &job.ref_frame.data,
+                        );
+                        let dist_f32 = ImageData::from_rgba8(
+                            job.dist_frame.width,
+                            job.dist_frame.height,
+                            &job.dist_frame.data,
+                        );
+                        match (ref_f32, dist_f32) {
+                            (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
+                            (Err(err), _) | (_, Err(err)) => Err(err),
+                        }
+                    }
+                };
+                let wall_ns = start.elapsed().as_nanos() as u64;
+                let gpu_time_ns = metric.gpu_time_ns().unwrap_or(0);
+                let result = match score {
+                    Ok(score) => JobResult {
+                        frame_num: job.frame_num,
+                        score: Some(score),
+                        gpu_time_ns,
+                        wall_ns,
+                        error: None,
+                    },
+                    Err(err) => JobResult {
+                        frame_num: job.frame_num,
+                        score: None,
+                        gpu_time_ns,
+                        wall_ns,
+                        error: Some(err.to_string()),
+                    },
+                };
+                if result_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+
+        senders.push(job_tx);
+    }
+
+    (senders, result_rx)
 }
 
 fn main() -> Result<()> {
@@ -82,16 +263,24 @@ fn main() -> Result<()> {
 
     // Initialize Vship
     println!("Initializing Vulkan...");
-    let ctx = MetricsContext::new()
-        .context("Failed to initialize Vship context")?;
+    let ctx = std::sync::Arc::new(
+        MetricsContext::new().context("Failed to initialize Vship context")?
+    );
+    let ctx_ref = std::sync::Arc::clone(&ctx);
 
     // Create metric
     println!("Creating {:?} metric...", cli.metric);
     let mut metric: Box<dyn Metric> = match cli.metric {
-        MetricType::Ssimulacra2 => Box::new(ctx.create_ssimulacra2()?),
-        MetricType::Butteraugli => Box::new(ctx.create_butteraugli()?),
-        MetricType::Cvvdp => Box::new(ctx.create_cvvdp()?),
+        MetricType::Ssimulacra2 => Box::new(ctx_ref.create_ssimulacra2()?),
+        MetricType::Butteraugli => Box::new(ctx_ref.create_butteraugli()?),
+        MetricType::Cvvdp => Box::new(ctx_ref.create_cvvdp()?),
     };
+    metric.set_compute_mode(cli.gpu_mode.into());
+    metric.set_reduce_mode(cli.reduce_mode.into());
+    println!("GPU mode: {:?}", cli.gpu_mode);
+    println!("Reduce mode: {:?}", cli.reduce_mode);
+    println!("Input format: {:?}", cli.input_format);
+    let metric_name = metric.name().to_string();
 
     // Open video files
     println!("Opening reference video: {:?}", cli.reference);
@@ -151,10 +340,11 @@ fn main() -> Result<()> {
     let mut current_fps = 0.0f64;
     let mut running_sum = 0.0f64;
     let mut last_score = 0.0f64;
+    let mut last_gpu_usage: Option<f64> = None;
 
     // Helper to print progress with scores
     let print_progress = |processed: usize, total: usize, fps: f64, elapsed: std::time::Duration,
-                          last: f64, avg: f64| {
+                          last: f64, avg: f64, gpu_usage: Option<f64>| {
         let percent = (processed as f64 / total as f64 * 100.0).min(100.0);
         let eta_secs = if fps > 0.0 {
             (total - processed) as f64 / fps
@@ -166,14 +356,25 @@ fn main() -> Result<()> {
         let elapsed_min = elapsed.as_secs() / 60;
         let elapsed_sec = elapsed.as_secs() % 60;
 
-        print!("\r[{:>3.0}%] {}/{} | {:.1} fps | Score: {:.1} (avg {:.1}) | {:02}:{:02} ETA {:02}:{:02}  ",
-               percent, processed, total, fps, last, avg, elapsed_min, elapsed_sec, eta_min, eta_sec);
+        match gpu_usage {
+            Some(gpu) => print!(
+                "\r[{:>3.0}%] {}/{} | {:.1} fps | GPU: {:>4.1}% | Score: {:.1} (avg {:.1}) | {:02}:{:02} ETA {:02}:{:02}  ",
+                percent, processed, total, fps, gpu, last, avg, elapsed_min, elapsed_sec, eta_min, eta_sec
+            ),
+            None => print!(
+                "\r[{:>3.0}%] {}/{} | {:.1} fps | GPU:  --  | Score: {:.1} (avg {:.1}) | {:02}:{:02} ETA {:02}:{:02}  ",
+                percent, processed, total, fps, last, avg, elapsed_min, elapsed_sec, eta_min, eta_sec
+            ),
+        }
         use std::io::Write;
         std::io::stdout().flush().ok();
     };
 
+    let use_inflight = cli.in_flight != 1;
+    let adaptive_inflight = cli.in_flight == 0;
+
     #[cfg(feature = "ffmpeg")]
-    if use_streaming {
+    if use_streaming && !use_inflight {
         // Streaming mode: decode and process frames on-the-fly
         let mut current_frame = 0;
         let mut processed = 0;
@@ -201,8 +402,28 @@ fn main() -> Result<()> {
 
             // Only process at step intervals
             if (current_frame - cli.start_frame) % cli.frame_step == 0 {
-                let score = metric.compute(&ref_frame, &dist_frame)
-                    .context(format!("Failed to compute metric for frame {}", current_frame))?;
+                let frame_start = std::time::Instant::now();
+                let score = match cli.input_format {
+                    InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
+                    InputFormat::F32 => {
+                        let ref_f32 = ImageData::from_rgba8(
+                            ref_frame.width,
+                            ref_frame.height,
+                            &ref_frame.data,
+                        );
+                        let dist_f32 = ImageData::from_rgba8(
+                            dist_frame.width,
+                            dist_frame.height,
+                            &dist_frame.data,
+                        );
+                        match (ref_f32, dist_f32) {
+                            (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
+                            (Err(err), _) | (_, Err(err)) => Err(err),
+                        }
+                    }
+                }
+                .context(format!("Failed to compute metric for frame {}", current_frame))?;
+                let frame_time = frame_start.elapsed();
 
                 scores.push(score);
                 frame_numbers.push(current_frame);
@@ -210,6 +431,14 @@ fn main() -> Result<()> {
                 frames_since_update += 1;
                 running_sum += score;
                 last_score = score;
+                last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                    let total_ns = frame_time.as_nanos() as f64;
+                    if total_ns > 0.0 {
+                        Some((ns as f64 / total_ns * 100.0).min(100.0))
+                    } else {
+                        None
+                    }
+                });
 
                 // Update progress every 100ms or every frame if slow
                 let now = std::time::Instant::now();
@@ -220,7 +449,7 @@ fn main() -> Result<()> {
                     }
                     let avg_score = running_sum / processed as f64;
                     print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
-                                   last_score, avg_score);
+                                   last_score, avg_score, last_gpu_usage);
                     last_update = now;
                     frames_since_update = 0;
                 }
@@ -228,7 +457,7 @@ fn main() -> Result<()> {
 
             current_frame += 1;
         }
-    } else {
+    } else if !use_inflight {
         // Cached mode: frames already loaded
         for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
             let ref_frame = ref_reader.read_frame(frame_num)
@@ -237,14 +466,42 @@ fn main() -> Result<()> {
             let dist_frame = dist_reader.read_frame(frame_num)
                 .context(format!("Failed to read distorted frame {}", frame_num))?;
 
-            let score = metric.compute(&ref_frame, &dist_frame)
-                .context(format!("Failed to compute metric for frame {}", frame_num))?;
+            let frame_start = std::time::Instant::now();
+            let score = match cli.input_format {
+                InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
+                InputFormat::F32 => {
+                    let ref_f32 = ImageData::from_rgba8(
+                        ref_frame.width,
+                        ref_frame.height,
+                        &ref_frame.data,
+                    );
+                    let dist_f32 = ImageData::from_rgba8(
+                        dist_frame.width,
+                        dist_frame.height,
+                        &dist_frame.data,
+                    );
+                    match (ref_f32, dist_f32) {
+                        (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
+                        (Err(err), _) | (_, Err(err)) => Err(err),
+                    }
+                }
+            }
+            .context(format!("Failed to compute metric for frame {}", frame_num))?;
+            let frame_time = frame_start.elapsed();
 
             scores.push(score);
             frame_numbers.push(frame_num);
             frames_since_update += 1;
             running_sum += score;
             last_score = score;
+            last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                let total_ns = frame_time.as_nanos() as f64;
+                if total_ns > 0.0 {
+                    Some((ns as f64 / total_ns * 100.0).min(100.0))
+                } else {
+                    None
+                }
+            });
 
             // Update progress every 100ms or every frame if slow
             let now = std::time::Instant::now();
@@ -255,43 +512,366 @@ fn main() -> Result<()> {
                 }
                 let avg_score = running_sum / (i + 1) as f64;
                 print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
-                               last_score, avg_score);
+                               last_score, avg_score, last_gpu_usage);
                 last_update = now;
                 frames_since_update = 0;
             }
         }
+    } else {
+        let max_workers = if adaptive_inflight {
+            cli.in_flight_max.max(1)
+        } else {
+            cli.in_flight.max(1)
+        };
+        let mut active_workers = if adaptive_inflight { 1 } else { max_workers };
+        let gpu_sum = Cell::new(0.0f64);
+        let gpu_samples = Cell::new(0usize);
+        let gpu_target_low = 55.0f64;
+        let gpu_target_high = 80.0f64;
+        let adjust_after = 60usize;
+
+        let (job_senders, result_rx) = spawn_workers(
+            std::sync::Arc::clone(&ctx),
+            cli.metric,
+            cli.gpu_mode,
+            cli.reduce_mode,
+            cli.input_format,
+            max_workers,
+        );
+        let mut next_worker = 0;
+        let mut pending = 0usize;
+        let mut processed = 0usize;
+        let mut results: Vec<(usize, f64)> = Vec::with_capacity(total_frames);
+
+        let mut handle_result = |result: JobResult| -> Result<()> {
+            if let Some(err) = result.error {
+                anyhow::bail!("Failed to compute metric for frame {}: {}", result.frame_num, err);
+            }
+            let score = result.score.unwrap_or(0.0);
+            results.push((result.frame_num, score));
+            processed += 1;
+            frames_since_update += 1;
+            running_sum += score;
+            last_score = score;
+            if result.wall_ns > 0 && result.gpu_time_ns > 0 {
+                let usage = ((result.gpu_time_ns as f64 / result.wall_ns as f64) * 100.0).min(100.0);
+                last_gpu_usage = Some(usage);
+                if adaptive_inflight {
+                    gpu_sum.set(gpu_sum.get() + usage);
+                    gpu_samples.set(gpu_samples.get() + 1);
+                }
+            }
+
+            let now = std::time::Instant::now();
+            if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                let dt = now.duration_since(last_update).as_secs_f64();
+                if dt > 0.0 {
+                    current_fps = frames_since_update as f64 / dt;
+                }
+                let avg_score = running_sum / processed as f64;
+                print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                               last_score, avg_score, last_gpu_usage);
+                last_update = now;
+                frames_since_update = 0;
+            }
+            Ok(())
+        };
+
+        #[cfg(feature = "ffmpeg")]
+        if use_streaming {
+            let mut current_frame = 0usize;
+            while let Some(ref_frame) = ref_reader.decode_next()? {
+                let dist_frame = match dist_reader.decode_next()? {
+                    Some(f) => f,
+                    None => {
+                        log::warn!("Distorted video ended before reference");
+                        break;
+                    }
+                };
+
+                if current_frame < cli.start_frame {
+                    current_frame += 1;
+                    continue;
+                }
+
+                if current_frame >= effective_end {
+                    break;
+                }
+
+                if (current_frame - cli.start_frame) % cli.frame_step == 0 {
+                    let job = Job {
+                        frame_num: current_frame,
+                        ref_frame,
+                        dist_frame,
+                    };
+                    job_senders[next_worker].send(job).map_err(|_| {
+                        anyhow::anyhow!("Worker channel closed while submitting frame {}", current_frame)
+                    })?;
+                    next_worker = (next_worker + 1) % active_workers;
+                    pending += 1;
+
+                    if pending >= active_workers {
+                        let result = result_rx.recv().context("Worker channel closed unexpectedly")?;
+                        handle_result(result)?;
+                        if adaptive_inflight && gpu_samples.get() >= adjust_after {
+                            let avg = gpu_sum.get() / gpu_samples.get() as f64;
+                            if avg < gpu_target_low && active_workers < max_workers {
+                                active_workers += 1;
+                                log::info!("Increasing in-flight to {}", active_workers);
+                            } else if avg > gpu_target_high && active_workers > 1 {
+                                active_workers -= 1;
+                                log::info!("Decreasing in-flight to {}", active_workers);
+                            }
+                            next_worker %= active_workers;
+                            gpu_sum.set(0.0);
+                            gpu_samples.set(0);
+                        }
+                        pending -= 1;
+                    }
+                }
+
+                current_frame += 1;
+            }
+        } else {
+            for frame_num in (cli.start_frame..effective_end).step_by(cli.frame_step) {
+                let ref_frame = ref_reader.read_frame(frame_num)
+                    .context(format!("Failed to read reference frame {}", frame_num))?;
+                let dist_frame = dist_reader.read_frame(frame_num)
+                    .context(format!("Failed to read distorted frame {}", frame_num))?;
+                let job = Job {
+                    frame_num,
+                    ref_frame,
+                    dist_frame,
+                };
+                job_senders[next_worker].send(job).map_err(|_| {
+                    anyhow::anyhow!("Worker channel closed while submitting frame {}", frame_num)
+                })?;
+                next_worker = (next_worker + 1) % active_workers;
+                pending += 1;
+
+                if pending >= active_workers {
+                    let result = result_rx.recv().context("Worker channel closed unexpectedly")?;
+                    handle_result(result)?;
+                    if adaptive_inflight && gpu_samples.get() >= adjust_after {
+                        let avg = gpu_sum.get() / gpu_samples.get() as f64;
+                        if avg < gpu_target_low && active_workers < max_workers {
+                            active_workers += 1;
+                            log::info!("Increasing in-flight to {}", active_workers);
+                        } else if avg > gpu_target_high && active_workers > 1 {
+                            active_workers -= 1;
+                            log::info!("Decreasing in-flight to {}", active_workers);
+                        }
+                        next_worker %= active_workers;
+                        gpu_sum.set(0.0);
+                        gpu_samples.set(0);
+                    }
+                    pending -= 1;
+                }
+            }
+        }
+
+        while pending > 0 {
+            let result = result_rx.recv().context("Worker channel closed unexpectedly")?;
+            handle_result(result)?;
+            if adaptive_inflight && gpu_samples.get() >= adjust_after {
+                let avg = gpu_sum.get() / gpu_samples.get() as f64;
+                if avg < gpu_target_low && active_workers < max_workers {
+                    active_workers += 1;
+                    log::info!("Increasing in-flight to {}", active_workers);
+                } else if avg > gpu_target_high && active_workers > 1 {
+                    active_workers -= 1;
+                    log::info!("Decreasing in-flight to {}", active_workers);
+                }
+                next_worker %= active_workers;
+                gpu_sum.set(0.0);
+                gpu_samples.set(0);
+            }
+            pending -= 1;
+        }
+
+        results.sort_by_key(|(frame, _)| *frame);
+        scores = results.iter().map(|(_, score)| *score).collect();
+        frame_numbers = results.iter().map(|(frame, _)| *frame).collect();
     }
 
     #[cfg(not(feature = "ffmpeg"))]
-    for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
-        let ref_frame = ref_reader.read_frame(frame_num)
-            .context(format!("Failed to read reference frame {}", frame_num))?;
+    if !use_inflight {
+        for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
+            let ref_frame = ref_reader.read_frame(frame_num)
+                .context(format!("Failed to read reference frame {}", frame_num))?;
 
-        let dist_frame = dist_reader.read_frame(frame_num)
-            .context(format!("Failed to read distorted frame {}", frame_num))?;
+            let dist_frame = dist_reader.read_frame(frame_num)
+                .context(format!("Failed to read distorted frame {}", frame_num))?;
 
-        let score = metric.compute(&ref_frame, &dist_frame)
-            .context(format!("Failed to compute metric for frame {}", frame_num))?;
-
-        scores.push(score);
-        frame_numbers.push(frame_num);
-        frames_since_update += 1;
-        running_sum += score;
-        last_score = score;
-
-        // Update progress
-        let now = std::time::Instant::now();
-        if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
-            let dt = now.duration_since(last_update).as_secs_f64();
-            if dt > 0.0 {
-                current_fps = frames_since_update as f64 / dt;
+            let frame_start = std::time::Instant::now();
+            let score = match cli.input_format {
+                InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
+                InputFormat::F32 => {
+                    let ref_f32 = ImageData::from_rgba8(
+                        ref_frame.width,
+                        ref_frame.height,
+                        &ref_frame.data,
+                    );
+                    let dist_f32 = ImageData::from_rgba8(
+                        dist_frame.width,
+                        dist_frame.height,
+                        &dist_frame.data,
+                    );
+                    match (ref_f32, dist_f32) {
+                        (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
+                        (Err(err), _) | (_, Err(err)) => Err(err),
+                    }
+                }
             }
-            let avg_score = running_sum / (i + 1) as f64;
-            print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
-                           last_score, avg_score);
-            last_update = now;
-            frames_since_update = 0;
+            .context(format!("Failed to compute metric for frame {}", frame_num))?;
+            let frame_time = frame_start.elapsed();
+
+            scores.push(score);
+            frame_numbers.push(frame_num);
+            frames_since_update += 1;
+            running_sum += score;
+            last_score = score;
+            last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                let total_ns = frame_time.as_nanos() as f64;
+                if total_ns > 0.0 {
+                    Some((ns as f64 / total_ns * 100.0).min(100.0))
+                } else {
+                    None
+                }
+            });
+
+            // Update progress
+            let now = std::time::Instant::now();
+            if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
+                let dt = now.duration_since(last_update).as_secs_f64();
+                if dt > 0.0 {
+                    current_fps = frames_since_update as f64 / dt;
+                }
+                let avg_score = running_sum / (i + 1) as f64;
+                print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
+                               last_score, avg_score, last_gpu_usage);
+                last_update = now;
+                frames_since_update = 0;
+            }
         }
+    } else {
+        let max_workers = if adaptive_inflight {
+            cli.in_flight_max.max(1)
+        } else {
+            cli.in_flight.max(1)
+        };
+        let mut active_workers = if adaptive_inflight { 1 } else { max_workers };
+        let gpu_sum = Cell::new(0.0f64);
+        let gpu_samples = Cell::new(0usize);
+        let gpu_target_low = 55.0f64;
+        let gpu_target_high = 80.0f64;
+        let adjust_after = 60usize;
+
+        let (job_senders, result_rx) = spawn_workers(
+            std::sync::Arc::clone(&ctx),
+            cli.metric,
+            cli.gpu_mode,
+            cli.reduce_mode,
+            cli.input_format,
+            max_workers,
+        );
+        let mut next_worker = 0;
+        let mut pending = 0usize;
+        let mut processed = 0usize;
+        let mut results: Vec<(usize, f64)> = Vec::with_capacity(total_frames);
+
+        let mut handle_result = |result: JobResult| -> Result<()> {
+            if let Some(err) = result.error {
+                anyhow::bail!("Failed to compute metric for frame {}: {}", result.frame_num, err);
+            }
+            let score = result.score.unwrap_or(0.0);
+            results.push((result.frame_num, score));
+            processed += 1;
+            frames_since_update += 1;
+            running_sum += score;
+            last_score = score;
+            if result.wall_ns > 0 && result.gpu_time_ns > 0 {
+                let usage = ((result.gpu_time_ns as f64 / result.wall_ns as f64) * 100.0).min(100.0);
+                last_gpu_usage = Some(usage);
+                if adaptive_inflight {
+                    gpu_sum.set(gpu_sum.get() + usage);
+                    gpu_samples.set(gpu_samples.get() + 1);
+                }
+            }
+
+            let now = std::time::Instant::now();
+            if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                let dt = now.duration_since(last_update).as_secs_f64();
+                if dt > 0.0 {
+                    current_fps = frames_since_update as f64 / dt;
+                }
+                let avg_score = running_sum / processed as f64;
+                print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                               last_score, avg_score, last_gpu_usage);
+                last_update = now;
+                frames_since_update = 0;
+            }
+            Ok(())
+        };
+
+        for frame_num in (cli.start_frame..effective_end).step_by(cli.frame_step) {
+            let ref_frame = ref_reader.read_frame(frame_num)
+                .context(format!("Failed to read reference frame {}", frame_num))?;
+            let dist_frame = dist_reader.read_frame(frame_num)
+                .context(format!("Failed to read distorted frame {}", frame_num))?;
+            let job = Job {
+                frame_num,
+                ref_frame,
+                dist_frame,
+            };
+            job_senders[next_worker].send(job).map_err(|_| {
+                anyhow::anyhow!("Worker channel closed while submitting frame {}", frame_num)
+            })?;
+            next_worker = (next_worker + 1) % active_workers;
+            pending += 1;
+
+            if pending >= active_workers {
+                let result = result_rx.recv().context("Worker channel closed unexpectedly")?;
+                handle_result(result)?;
+                if adaptive_inflight && gpu_samples.get() >= adjust_after {
+                    let avg = gpu_sum.get() / gpu_samples.get() as f64;
+                    if avg < gpu_target_low && active_workers < max_workers {
+                        active_workers += 1;
+                        log::info!("Increasing in-flight to {}", active_workers);
+                    } else if avg > gpu_target_high && active_workers > 1 {
+                        active_workers -= 1;
+                        log::info!("Decreasing in-flight to {}", active_workers);
+                    }
+                    next_worker %= active_workers;
+                    gpu_sum.set(0.0);
+                    gpu_samples.set(0);
+                }
+                pending -= 1;
+            }
+        }
+
+        while pending > 0 {
+            let result = result_rx.recv().context("Worker channel closed unexpectedly")?;
+            handle_result(result)?;
+            if adaptive_inflight && gpu_samples.get() >= adjust_after {
+                let avg = gpu_sum.get() / gpu_samples.get() as f64;
+                if avg < gpu_target_low && active_workers < max_workers {
+                    active_workers += 1;
+                    log::info!("Increasing in-flight to {}", active_workers);
+                } else if avg > gpu_target_high && active_workers > 1 {
+                    active_workers -= 1;
+                    log::info!("Decreasing in-flight to {}", active_workers);
+                }
+                next_worker %= active_workers;
+                gpu_sum.set(0.0);
+                gpu_samples.set(0);
+            }
+            pending -= 1;
+        }
+
+        results.sort_by_key(|(frame, _)| *frame);
+        scores = results.iter().map(|(_, score)| *score).collect();
+        frame_numbers = results.iter().map(|(frame, _)| *frame).collect();
     }
 
     // Final progress update
@@ -314,7 +894,7 @@ fn main() -> Result<()> {
 
     println!("\nResults:");
     println!("─────────────────────────────");
-    println!("{} Statistics:", metric.name());
+    println!("{} Statistics:", metric_name);
     println!("  Mean:   {:.4}", mean_score);
     println!("  Min:    {:.4}", min_score);
     println!("  Max:    {:.4}", max_score);
@@ -324,7 +904,7 @@ fn main() -> Result<()> {
     // Save results if output file specified
     if let Some(output_path) = cli.output {
         let results = serde_json::json!({
-            "metric": metric.name(),
+            "metric": metric_name,
             "reference": cli.reference,
             "distorted": cli.distorted,
             "version": "4.1.0",

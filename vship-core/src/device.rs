@@ -64,6 +64,7 @@ pub struct VulkanDevice {
     properties: vk::PhysicalDeviceProperties,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     command_pool: Mutex<vk::CommandPool>,
+    supports_timeline_semaphore: bool,
 }
 
 impl VulkanDevice {
@@ -93,8 +94,21 @@ impl VulkanDevice {
             .queue_family_index(compute_queue_family)
             .queue_priorities(&queue_priorities);
 
-        let device_create_info = vk::DeviceCreateInfo::default()
+        let mut timeline_features = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut timeline_features);
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+        let supports_timeline = timeline_features.timeline_semaphore == vk::TRUE;
+
+        if supports_timeline {
+            timeline_features.timeline_semaphore = vk::TRUE;
+        }
+
+        let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_create_info));
+        if supports_timeline {
+            device_create_info = device_create_info.push_next(&mut timeline_features);
+        }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None)? };
 
@@ -126,6 +140,7 @@ impl VulkanDevice {
             properties,
             memory_properties,
             command_pool: Mutex::new(command_pool),
+            supports_timeline_semaphore: supports_timeline,
         })
     }
 
@@ -147,6 +162,11 @@ impl VulkanDevice {
     /// Get device properties
     pub fn properties(&self) -> &vk::PhysicalDeviceProperties {
         &self.properties
+    }
+
+    /// Timestamp period in nanoseconds
+    pub fn timestamp_period(&self) -> f32 {
+        self.properties.limits.timestamp_period
     }
 
     /// Get memory properties
@@ -186,6 +206,59 @@ impl VulkanDevice {
         Ok(())
     }
 
+    /// Submit commands and signal a timeline semaphore value
+    pub fn submit_compute_with_timeline(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        signal_semaphore: vk::Semaphore,
+        signal_value: u64,
+        fence: vk::Fence,
+    ) -> Result<()> {
+        let queue = self.compute_queue.lock().unwrap();
+
+        let signal_values = [signal_value];
+        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+            .signal_semaphore_values(&signal_values);
+
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(command_buffers)
+            .signal_semaphores(std::slice::from_ref(&signal_semaphore))
+            .push_next(&mut timeline_info);
+
+        unsafe {
+            self.device.queue_submit(*queue, &[submit_info], fence)?;
+        }
+
+        Ok(())
+    }
+
+    /// Create a timeline semaphore
+    pub fn create_timeline_semaphore(&self, initial_value: u64) -> Result<vk::Semaphore> {
+        let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(initial_value);
+
+        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+        let semaphore = unsafe { self.device.create_semaphore(&create_info, None)? };
+        Ok(semaphore)
+    }
+
+    /// Wait for a timeline semaphore value
+    pub fn wait_timeline_semaphore(
+        &self,
+        semaphore: vk::Semaphore,
+        value: u64,
+        timeout: u64,
+    ) -> Result<()> {
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(std::slice::from_ref(&semaphore))
+            .values(std::slice::from_ref(&value));
+        unsafe {
+            self.device.wait_semaphores(&info, timeout)?;
+        }
+        Ok(())
+    }
+
     /// Wait for device to become idle
     pub fn wait_idle(&self) -> Result<()> {
         unsafe { self.device.device_wait_idle()? };
@@ -203,6 +276,14 @@ impl VulkanDevice {
 
         let buffers = unsafe { self.device.allocate_command_buffers(&alloc_info)? };
         Ok(buffers)
+    }
+
+    /// Reset a command buffer to initial state
+    pub fn reset_command_buffer(&self, command_buffer: vk::CommandBuffer) -> Result<()> {
+        unsafe {
+            self.device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())?;
+        }
+        Ok(())
     }
 
     /// Free command buffers
@@ -241,6 +322,11 @@ impl VulkanDevice {
     /// Destroy fence
     pub fn destroy_fence(&self, fence: vk::Fence) {
         unsafe { self.device.destroy_fence(fence, None) };
+    }
+
+    /// Check if timeline semaphores are supported
+    pub fn supports_timeline_semaphore(&self) -> bool {
+        self.supports_timeline_semaphore
     }
 }
 

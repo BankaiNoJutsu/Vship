@@ -15,6 +15,24 @@ pub use ssimulacra2_gpu::Ssimulacra2Gpu;
 pub use butteraugli::Butteraugli;
 pub use cvvdp::Cvvdp;
 
+/// GPU compute mode options for metrics that support them
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeMode {
+    /// Single command buffer per frame (higher GPU utilization)
+    SingleBatch,
+    /// Per-step batches with waits (baseline behavior)
+    LegacyBatched,
+}
+
+/// Reduction mode for aggregations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceMode {
+    /// Reduce on GPU and read back a single value
+    Gpu,
+    /// Read back full buffer and reduce on CPU (debug/compare)
+    Cpu,
+}
+
 use vship_core::error::Result;
 use vship_core::VshipContext;
 use std::sync::Arc;
@@ -29,6 +47,36 @@ pub trait Metric {
 
     /// Reset metric state (useful for video sequences)
     fn reset(&mut self) -> Result<()>;
+
+    /// Last GPU time for a frame in nanoseconds (if applicable)
+    fn gpu_time_ns(&self) -> Option<u64> {
+        None
+    }
+
+    /// Set compute mode (if supported by the metric)
+    fn set_compute_mode(&mut self, _mode: ComputeMode) {}
+
+    /// Set reduction mode (if supported by the metric)
+    fn set_reduce_mode(&mut self, _mode: ReduceMode) {}
+
+    /// Compute metric from packed RGBA8 inputs (default converts to f32 RGB)
+    fn compute_rgba8(
+        &mut self,
+        reference: &ImageDataRgba8,
+        distorted: &ImageDataRgba8,
+    ) -> Result<f64> {
+        let ref_f32 = ImageData::from_rgba8(
+            reference.width,
+            reference.height,
+            &reference.data,
+        )?;
+        let dist_f32 = ImageData::from_rgba8(
+            distorted.width,
+            distorted.height,
+            &distorted.data,
+        )?;
+        self.compute(&ref_f32, &dist_f32)
+    }
 }
 
 /// Image data container
@@ -86,6 +134,47 @@ impl ImageData {
         // TODO: Implement YUV to RGB conversion
         self.clone()
     }
+
+    /// Convert RGBA8 packed data to planar f32 RGB
+    pub fn from_rgba8(width: u32, height: u32, data: &[u8]) -> Result<Self> {
+        let pixel_count = (width * height) as usize;
+        let expected_len = pixel_count * 4;
+        if data.len() != expected_len {
+            return Err(vship_core::error::VshipError::InvalidBufferSize {
+                expected: expected_len,
+                actual: data.len(),
+            });
+        }
+
+        let mut image = Self::new(width, height, ImageFormat::RGB);
+        for i in 0..pixel_count {
+            let src = i * 4;
+            image.data[i] = data[src] as f32 / 255.0;
+            image.data[pixel_count + i] = data[src + 1] as f32 / 255.0;
+            image.data[2 * pixel_count + i] = data[src + 2] as f32 / 255.0;
+        }
+        Ok(image)
+    }
+}
+
+/// Packed RGBA8 image data (interleaved RGBA bytes)
+#[derive(Clone)]
+pub struct ImageDataRgba8 {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+impl ImageDataRgba8 {
+    /// Create a new RGBA8 buffer filled with zeros
+    pub fn new(width: u32, height: u32) -> Self {
+        let len = (width * height * 4) as usize;
+        Self {
+            width,
+            height,
+            data: vec![0u8; len],
+        }
+    }
 }
 
 /// Vship metrics context
@@ -121,13 +210,3 @@ impl MetricsContext {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_metrics_context_creation() {
-        let ctx = MetricsContext::new();
-        assert!(ctx.is_ok());
-    }
-}

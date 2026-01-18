@@ -1,0 +1,46 @@
+#version 450
+
+// Parallel reduction to sum a float buffer
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint element_count;
+} pc;
+
+shared float shared_data[256];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint global_size = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
+
+    float sum = 0.0;
+    for (uint i = gid; i < pc.element_count; i += global_size) {
+        sum += input_data[i];
+    }
+
+    shared_data[lid] = sum;
+    memoryBarrierShared();
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            shared_data[lid] += shared_data[lid + stride];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    if (lid == 0) {
+        output_data[gl_WorkGroupID.x] = shared_data[0];
+    }
+}

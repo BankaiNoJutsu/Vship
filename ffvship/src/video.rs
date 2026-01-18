@@ -1,7 +1,7 @@
 // Video file reading and decoding using FFmpeg
 
 use anyhow::{Result, Context};
-use vship_metrics::{ImageData, ImageFormat};
+use vship_metrics::ImageDataRgba8;
 use std::path::Path;
 
 #[cfg(feature = "ffmpeg")]
@@ -12,7 +12,7 @@ pub struct VideoReader {
     #[cfg(feature = "ffmpeg")]
     decoder: FfmpegDecoder,
     #[cfg(feature = "ffmpeg")]
-    frame_cache: Option<Vec<ImageData>>,
+    frame_cache: Option<Vec<ImageDataRgba8>>,
     #[cfg(feature = "ffmpeg")]
     cache_start_frame: usize,
     #[cfg(feature = "ffmpeg")]
@@ -132,7 +132,7 @@ impl VideoReader {
 
     /// Decode the next frame in streaming mode
     #[cfg(feature = "ffmpeg")]
-    pub fn decode_next(&mut self) -> Result<Option<ImageData>> {
+    pub fn decode_next(&mut self) -> Result<Option<ImageDataRgba8>> {
         if !self.streaming_mode {
             anyhow::bail!("Not in streaming mode. Call enable_streaming() first");
         }
@@ -152,7 +152,7 @@ impl VideoReader {
     }
 
     /// Read a specific frame
-    pub fn read_frame(&mut self, frame_num: usize) -> Result<ImageData> {
+    pub fn read_frame(&mut self, frame_num: usize) -> Result<ImageDataRgba8> {
         #[cfg(feature = "ffmpeg")]
         {
             let cache = self.frame_cache.as_ref()
@@ -178,12 +178,12 @@ impl VideoReader {
                 anyhow::bail!("Frame {} out of range (total: {})", frame_num, self.frame_count);
             }
             // Return placeholder black frame
-            Ok(ImageData::new(self.width, self.height, ImageFormat::RGB))
+            Ok(ImageDataRgba8::new(self.width, self.height))
         }
     }
 
     /// Read next frame in sequence
-    pub fn read_next_frame(&mut self) -> Result<Option<ImageData>> {
+    pub fn read_next_frame(&mut self) -> Result<Option<ImageDataRgba8>> {
         #[cfg(feature = "ffmpeg")]
         {
             // Not implemented with cache-based approach
@@ -231,7 +231,7 @@ impl FrameIterator {
 }
 
 impl Iterator for FrameIterator {
-    type Item = Result<(usize, ImageData)>;
+    type Item = Result<(usize, ImageDataRgba8)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_frame >= self.end_frame {
@@ -277,7 +277,7 @@ pub fn process_video_pair<F>(
     mut metric_fn: F,
 ) -> Result<Vec<f64>>
 where
-    F: FnMut(&ImageData, &ImageData) -> Result<f64>,
+    F: FnMut(&ImageDataRgba8, &ImageDataRgba8) -> Result<f64>,
 {
     let mut ref_reader = VideoReader::open(reference_path)?;
     let mut dist_reader = VideoReader::open(distorted_path)?;

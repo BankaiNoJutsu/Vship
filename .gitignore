@@ -6,6 +6,13 @@ test.cpp
 *.y4m
 *.mkv
 *.ffindex
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.webm
+*.mpg
+*.mpeg
 
 # Prerequisites
 *.d
@@ -57,3 +64,6 @@ release/
 # Profiling
 *.profdata
 *.profraw
+
+# SPV files
+*.spv
