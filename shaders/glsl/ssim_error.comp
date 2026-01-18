@@ -1,0 +1,44 @@
+#version 450
+
+// Compute SSIM-inspired error between reference and distorted images
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer ReferenceBuffer {
+    float reference[];
+};
+
+layout(set = 0, binding = 1) readonly buffer DistortedBuffer {
+    float distorted[];
+};
+
+layout(set = 0, binding = 2) buffer ErrorBuffer {
+    float errors[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint channel;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total_pixels = pc.width * pc.height;
+
+    if (idx >= total_pixels) {
+        return;
+    }
+
+    // Offset for the current channel
+    uint channel_offset = pc.channel * total_pixels;
+    uint pixel_idx = channel_offset + idx;
+
+    float ref_val = reference[pixel_idx];
+    float dist_val = distorted[pixel_idx];
+
+    // Compute absolute difference (simple error metric)
+    float error = abs(ref_val - dist_val);
+
+    errors[idx] = error;
+}

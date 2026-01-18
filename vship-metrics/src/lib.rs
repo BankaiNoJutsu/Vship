@@ -6,6 +6,9 @@ pub mod butteraugli;
 pub mod cvvdp;
 pub mod common;
 
+#[cfg(test)]
+mod tests;
+
 pub use ssimulacra2::Ssimulacra2;
 pub use butteraugli::Butteraugli;
 pub use cvvdp::Cvvdp;

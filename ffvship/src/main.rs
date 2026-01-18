@@ -1,10 +1,13 @@
 // FFVship - CLI tool for computing video quality metrics
 // Supports SSIMULACRA2, Butteraugli, and CVVDP metrics
 
+mod video;
+
 use clap::{Parser, ValueEnum};
 use anyhow::{Result, Context};
-use vship_metrics::{MetricsContext, Metric, ImageData, ImageFormat};
+use vship_metrics::{MetricsContext, Metric};
 use std::path::PathBuf;
+use video::VideoReader;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum MetricType {
@@ -88,27 +91,85 @@ fn main() -> Result<()> {
         MetricType::Cvvdp => Box::new(ctx.create_cvvdp()?),
     };
 
-    // TODO: Implement video file reading using ffmpeg-next
-    // For now, we'll demonstrate with a placeholder
-    println!("Reference: {:?}", cli.reference);
-    println!("Distorted: {:?}", cli.distorted);
+    // Open video files
+    println!("Opening reference video: {:?}", cli.reference);
+    let mut ref_reader = VideoReader::open(&cli.reference)?;
 
+    println!("Opening distorted video: {:?}", cli.distorted);
+    let mut dist_reader = VideoReader::open(&cli.distorted)?;
+
+    // Validate dimensions match
+    if ref_reader.width() != dist_reader.width() || ref_reader.height() != dist_reader.height() {
+        anyhow::bail!(
+            "Video dimensions mismatch: reference {}x{}, distorted {}x{}",
+            ref_reader.width(),
+            ref_reader.height(),
+            dist_reader.width(),
+            dist_reader.height()
+        );
+    }
+
+    println!("Video resolution: {}x{}", ref_reader.width(), ref_reader.height());
+    println!("Frame count: {}", ref_reader.frame_count());
+
+    // Process frames
     println!("\nProcessing frames...");
-    println!("Note: Full video processing will be implemented with FFmpeg integration");
+    let effective_end = if cli.end_frame == 0 {
+        ref_reader.frame_count().min(dist_reader.frame_count())
+    } else {
+        cli.end_frame
+    };
 
-    // Placeholder: Create dummy test images
-    let width = 1920;
-    let height = 1080;
+    let total_frames = (effective_end - cli.start_frame) / cli.frame_step;
+    println!("Processing {} frames ({}..{}, step {})",
+             total_frames, cli.start_frame, effective_end, cli.frame_step);
 
-    let reference = ImageData::new(width, height, ImageFormat::RGB);
-    let distorted = ImageData::new(width, height, ImageFormat::RGB);
+    let mut scores = Vec::new();
+    let mut frame_numbers = Vec::new();
 
-    // Compute metric
-    let score = metric.compute(&reference, &distorted)?;
+    for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
+        if cli.verbose {
+            print!("\rFrame {}/{}: {}", i + 1, total_frames, frame_num);
+            use std::io::Write;
+            std::io::stdout().flush()?;
+        }
+
+        let ref_frame = ref_reader.read_frame(frame_num)
+            .context(format!("Failed to read reference frame {}", frame_num))?;
+
+        let dist_frame = dist_reader.read_frame(frame_num)
+            .context(format!("Failed to read distorted frame {}", frame_num))?;
+
+        let score = metric.compute(&ref_frame, &dist_frame)
+            .context(format!("Failed to compute metric for frame {}", frame_num))?;
+
+        scores.push(score);
+        frame_numbers.push(frame_num);
+    }
+
+    if cli.verbose {
+        println!();
+    }
+
+    // Compute statistics
+    let mean_score = scores.iter().sum::<f64>() / scores.len() as f64;
+    let min_score = scores.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+    let max_score = scores.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+
+    // Compute standard deviation
+    let variance = scores.iter()
+        .map(|s| (s - mean_score).powi(2))
+        .sum::<f64>() / scores.len() as f64;
+    let std_dev = variance.sqrt();
 
     println!("\nResults:");
     println!("─────────────────────────────");
-    println!("{}: {:.4}", metric.name(), score);
+    println!("{} Statistics:", metric.name());
+    println!("  Mean:   {:.4}", mean_score);
+    println!("  Min:    {:.4}", min_score);
+    println!("  Max:    {:.4}", max_score);
+    println!("  StdDev: {:.4}", std_dev);
+    println!("  Frames: {}", scores.len());
 
     // Save results if output file specified
     if let Some(output_path) = cli.output {
@@ -116,8 +177,20 @@ fn main() -> Result<()> {
             "metric": metric.name(),
             "reference": cli.reference,
             "distorted": cli.distorted,
-            "score": score,
             "version": "4.1.0",
+            "statistics": {
+                "mean": mean_score,
+                "min": min_score,
+                "max": max_score,
+                "std_dev": std_dev,
+                "frame_count": scores.len(),
+            },
+            "per_frame_scores": scores.iter().enumerate().map(|(i, &score)| {
+                serde_json::json!({
+                    "frame": frame_numbers[i],
+                    "score": score,
+                })
+            }).collect::<Vec<_>>(),
         });
 
         std::fs::write(&output_path, serde_json::to_string_pretty(&results)?)?;
@@ -125,41 +198,4 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-// Module for video processing (to be implemented)
-#[allow(dead_code)]
-mod video {
-    use super::*;
-
-    pub struct VideoReader {
-        path: PathBuf,
-    }
-
-    impl VideoReader {
-        pub fn new(path: PathBuf) -> Result<Self> {
-            // TODO: Initialize FFmpeg video reader
-            Ok(Self { path })
-        }
-
-        pub fn read_frame(&mut self, _frame_num: usize) -> Result<ImageData> {
-            // TODO: Read frame from video
-            Ok(ImageData::new(1920, 1080, ImageFormat::RGB))
-        }
-
-        pub fn frame_count(&self) -> usize {
-            // TODO: Return actual frame count
-            0
-        }
-
-        pub fn width(&self) -> u32 {
-            // TODO: Return actual width
-            1920
-        }
-
-        pub fn height(&self) -> u32 {
-            // TODO: Return actual height
-            1080
-        }
-    }
 }

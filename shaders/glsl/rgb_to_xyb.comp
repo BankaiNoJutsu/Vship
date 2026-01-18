@@ -1,0 +1,75 @@
+#version 450
+
+// RGB to XYB color space conversion for SSIMULACRA2
+// Based on the opsin absorbance model
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer InputR {
+    float r[];
+};
+
+layout(set = 0, binding = 1) readonly buffer InputG {
+    float g[];
+};
+
+layout(set = 0, binding = 2) readonly buffer InputB {
+    float b[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputX {
+    float x[];
+};
+
+layout(set = 0, binding = 4) writeonly buffer OutputY {
+    float y[];
+};
+
+layout(set = 0, binding = 5) writeonly buffer OutputBOut {
+    float b_out[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+// Gamma correction (cube root)
+float gamma_correct(float v) {
+    if (v > 0.0) {
+        return pow(v, 1.0 / 3.0);
+    } else {
+        return -pow(-v, 1.0 / 3.0);
+    }
+}
+
+void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+
+    if (gx >= pc.width || gy >= pc.height) {
+        return;
+    }
+
+    uint idx = gy * pc.width + gx;
+
+    // Read RGB values
+    float r_val = r[idx];
+    float g_val = g[idx];
+    float b_val = b[idx];
+
+    // Approximate opsin absorbance (color mixing)
+    float mixed_r = 0.3 * r_val + 0.622 * g_val + 0.078 * b_val;
+    float mixed_g = 0.23 * r_val + 0.692 * g_val + 0.078 * b_val;
+    float mixed_b = 0.243 * r_val + 0.419 * g_val + 0.338 * b_val;
+
+    // Apply gamma correction (cube root)
+    float l = gamma_correct(mixed_r);
+    float m = gamma_correct(mixed_g);
+    float s = gamma_correct(mixed_b);
+
+    // Convert to XYB
+    x[idx] = 0.5 * (l - m);
+    y[idx] = 0.5 * (l + m);
+    b_out[idx] = s;
+}

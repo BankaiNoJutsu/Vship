@@ -6,6 +6,7 @@ pub mod memory;
 pub mod pipeline;
 pub mod buffer;
 pub mod shader;
+pub mod shader_manager;
 pub mod error;
 pub mod color;
 
@@ -14,6 +15,7 @@ pub use memory::{BufferAllocator, BufferUsage};
 pub use pipeline::{ComputePipeline, PipelineBuilder};
 pub use buffer::{Buffer, BufferView};
 pub use shader::ShaderModule;
+pub use shader_manager::ShaderManager;
 pub use error::{VshipError, Result};
 
 use ash::vk;

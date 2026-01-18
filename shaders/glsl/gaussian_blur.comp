@@ -1,0 +1,68 @@
+#version 450
+
+// Separable Gaussian blur compute shader
+// Performs either horizontal or vertical pass
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(set = 0, binding = 2) readonly buffer KernelBuffer {
+    float kernel[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint kernel_radius;
+    uint is_vertical;  // 0 = horizontal, 1 = vertical
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total_pixels = pc.width * pc.height;
+
+    if (idx >= total_pixels) {
+        return;
+    }
+
+    uint x = idx % pc.width;
+    uint y = idx / pc.width;
+
+    float sum = 0.0;
+    uint kernel_size = 2 * pc.kernel_radius + 1;
+
+    if (pc.is_vertical == 0) {
+        // Horizontal pass
+        for (uint k = 0; k < kernel_size; k++) {
+            int offset = int(k) - int(pc.kernel_radius);
+            int sample_x = int(x) + offset;
+
+            // Clamp to image boundaries
+            sample_x = clamp(sample_x, 0, int(pc.width) - 1);
+
+            uint sample_idx = y * pc.width + uint(sample_x);
+            sum += input_data[sample_idx] * kernel[k];
+        }
+    } else {
+        // Vertical pass
+        for (uint k = 0; k < kernel_size; k++) {
+            int offset = int(k) - int(pc.kernel_radius);
+            int sample_y = int(y) + offset;
+
+            // Clamp to image boundaries
+            sample_y = clamp(sample_y, 0, int(pc.height) - 1);
+
+            uint sample_idx = uint(sample_y) * pc.width + x;
+            sum += input_data[sample_idx] * kernel[k];
+        }
+    }
+
+    output_data[idx] = sum;
+}

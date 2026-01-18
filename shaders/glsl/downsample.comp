@@ -1,0 +1,48 @@
+#version 450
+
+// 2x downsampling using average of 2x2 blocks
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint input_width;
+    uint input_height;
+    uint output_width;
+    uint output_height;
+} pc;
+
+void main() {
+    uint out_x = gl_GlobalInvocationID.x;
+    uint out_y = gl_GlobalInvocationID.y;
+
+    if (out_x >= pc.output_width || out_y >= pc.output_height) {
+        return;
+    }
+
+    // Corresponding 2x2 block in input
+    uint in_x = out_x * 2;
+    uint in_y = out_y * 2;
+
+    // Sample 2x2 block
+    uint idx00 = in_y * pc.input_width + in_x;
+    uint idx01 = in_y * pc.input_width + (in_x + 1);
+    uint idx10 = (in_y + 1) * pc.input_width + in_x;
+    uint idx11 = (in_y + 1) * pc.input_width + (in_x + 1);
+
+    // Average
+    float avg = (input_data[idx00] +
+                 input_data[idx01] +
+                 input_data[idx10] +
+                 input_data[idx11]) * 0.25;
+
+    uint out_idx = out_y * pc.output_width + out_x;
+    output_data[out_idx] = avg;
+}
