@@ -15,7 +15,7 @@ use std::time::Instant;
 use std::path::PathBuf;
 use video::VideoReader;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MetricType {
     /// SSIMULACRA2 metric
     Ssimulacra2,
@@ -25,7 +25,7 @@ enum MetricType {
     Cvvdp,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuMode {
     /// Single command buffer per frame
     Single,
@@ -33,7 +33,7 @@ enum GpuMode {
     Legacy,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ReduceModeCli {
     /// Reduce on GPU and read back a single value
     Gpu,
@@ -41,7 +41,7 @@ enum ReduceModeCli {
     Cpu,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum InputFormat {
     /// Packed RGBA8 with GPU normalization
     Rgba8,
@@ -127,6 +127,10 @@ struct Cli {
     /// Input pixel format for comparison
     #[arg(long, value_enum, default_value = "rgba8")]
     input_format: InputFormat,
+
+    /// Frames per GPU submit (single mode only)
+    #[arg(long, default_value = "1")]
+    batch_frames: usize,
 }
 
 struct Job {
@@ -267,20 +271,54 @@ fn main() -> Result<()> {
         MetricsContext::new().context("Failed to initialize Vship context")?
     );
     let ctx_ref = std::sync::Arc::clone(&ctx);
+    let use_inflight = cli.in_flight != 1;
+    let adaptive_inflight = cli.in_flight == 0;
+    let use_batch = cli.batch_frames > 1;
+
+    if use_batch {
+        if cli.metric != MetricType::Ssimulacra2
+            || cli.input_format != InputFormat::Rgba8
+            || cli.reduce_mode != ReduceModeCli::Gpu
+            || cli.gpu_mode != GpuMode::Single
+            || use_inflight
+        {
+            anyhow::bail!(
+                "--batch-frames requires --metric ssimulacra2 --input-format rgba8 --reduce-mode gpu --gpu-mode single and --in-flight 1"
+            );
+        }
+    }
 
     // Create metric
     println!("Creating {:?} metric...", cli.metric);
-    let mut metric: Box<dyn Metric> = match cli.metric {
-        MetricType::Ssimulacra2 => Box::new(ctx_ref.create_ssimulacra2()?),
-        MetricType::Butteraugli => Box::new(ctx_ref.create_butteraugli()?),
-        MetricType::Cvvdp => Box::new(ctx_ref.create_cvvdp()?),
-    };
-    metric.set_compute_mode(cli.gpu_mode.into());
-    metric.set_reduce_mode(cli.reduce_mode.into());
+    let mut metric: Option<Box<dyn Metric>> = None;
+    let mut batch_metric: Option<vship_metrics::Ssimulacra2Gpu> = None;
+
+    if use_batch {
+        let mut metric_impl = ctx_ref.create_ssimulacra2()?;
+        metric_impl.set_compute_mode(cli.gpu_mode.into());
+        metric_impl.set_reduce_mode(cli.reduce_mode.into());
+        batch_metric = Some(metric_impl);
+    } else {
+        let mut metric_impl: Box<dyn Metric> = match cli.metric {
+            MetricType::Ssimulacra2 => Box::new(ctx_ref.create_ssimulacra2()?),
+            MetricType::Butteraugli => Box::new(ctx_ref.create_butteraugli()?),
+            MetricType::Cvvdp => Box::new(ctx_ref.create_cvvdp()?),
+        };
+        metric_impl.set_compute_mode(cli.gpu_mode.into());
+        metric_impl.set_reduce_mode(cli.reduce_mode.into());
+        metric = Some(metric_impl);
+    }
     println!("GPU mode: {:?}", cli.gpu_mode);
     println!("Reduce mode: {:?}", cli.reduce_mode);
     println!("Input format: {:?}", cli.input_format);
-    let metric_name = metric.name().to_string();
+    if use_batch {
+        println!("Batch frames: {}", cli.batch_frames);
+    }
+    let metric_name = if use_batch {
+        batch_metric.as_ref().unwrap().name().to_string()
+    } else {
+        metric.as_ref().unwrap().name().to_string()
+    };
 
     // Open video files
     println!("Opening reference video: {:?}", cli.reference);
@@ -370,38 +408,271 @@ fn main() -> Result<()> {
         std::io::stdout().flush().ok();
     };
 
-    let use_inflight = cli.in_flight != 1;
-    let adaptive_inflight = cli.in_flight == 0;
 
     #[cfg(feature = "ffmpeg")]
     if use_streaming && !use_inflight {
-        // Streaming mode: decode and process frames on-the-fly
-        let mut current_frame = 0;
-        let mut processed = 0;
+        if use_batch {
+            let mut current_frame = 0usize;
+            let mut processed = 0usize;
+            let mut batch_refs: Vec<ImageDataRgba8> = Vec::with_capacity(cli.batch_frames);
+            let mut batch_dists: Vec<ImageDataRgba8> = Vec::with_capacity(cli.batch_frames);
+            let mut batch_frames: Vec<usize> = Vec::with_capacity(cli.batch_frames);
+            let metric = batch_metric.as_mut().unwrap();
 
-        while let Some(ref_frame) = ref_reader.decode_next()? {
-            // Get corresponding distorted frame
-            let dist_frame = match dist_reader.decode_next()? {
-                Some(f) => f,
-                None => {
-                    log::warn!("Distorted video ended before reference");
-                    break;
+            let mut flush_batch = |batch_refs: &mut Vec<ImageDataRgba8>,
+                                   batch_dists: &mut Vec<ImageDataRgba8>,
+                                   batch_frames: &mut Vec<usize>| -> Result<()> {
+                if batch_refs.is_empty() {
+                    return Ok(());
                 }
+                let frame_start = std::time::Instant::now();
+                let scores_batch = metric
+                    .compute_batch_rgba8(batch_refs, batch_dists)
+                    .context("Failed to compute metric for batch")?;
+                let frame_time = frame_start.elapsed();
+
+                for (idx, score) in scores_batch.iter().enumerate() {
+                    let frame_num = batch_frames[idx];
+                    scores.push(*score);
+                    frame_numbers.push(frame_num);
+                    processed += 1;
+                    frames_since_update += 1;
+                    running_sum += *score;
+                    last_score = *score;
+                }
+
+                let per_frame_ns = frame_time.as_nanos() as f64 / scores_batch.len() as f64;
+                last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                    if per_frame_ns > 0.0 {
+                        Some((ns as f64 / per_frame_ns * 100.0).min(100.0))
+                    } else {
+                        None
+                    }
+                });
+
+                let now = std::time::Instant::now();
+                if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                    let dt = now.duration_since(last_update).as_secs_f64();
+                    if dt > 0.0 {
+                        current_fps = frames_since_update as f64 / dt;
+                    }
+                    let avg_score = running_sum / processed as f64;
+                    print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                                   last_score, avg_score, last_gpu_usage);
+                    last_update = now;
+                    frames_since_update = 0;
+                }
+
+                batch_refs.clear();
+                batch_dists.clear();
+                batch_frames.clear();
+
+                Ok(())
             };
 
-            // Skip frames before start
-            if current_frame < cli.start_frame {
+            while let Some(ref_frame) = ref_reader.decode_next()? {
+                let dist_frame = match dist_reader.decode_next()? {
+                    Some(f) => f,
+                    None => {
+                        log::warn!("Distorted video ended before reference");
+                        break;
+                    }
+                };
+
+                if current_frame < cli.start_frame {
+                    current_frame += 1;
+                    continue;
+                }
+
+                if current_frame >= effective_end {
+                    break;
+                }
+
+                if (current_frame - cli.start_frame) % cli.frame_step == 0 {
+                    batch_refs.push(ref_frame);
+                    batch_dists.push(dist_frame);
+                    batch_frames.push(current_frame);
+
+                    if batch_refs.len() >= cli.batch_frames {
+                        flush_batch(&mut batch_refs, &mut batch_dists, &mut batch_frames)?;
+                    }
+                }
+
                 current_frame += 1;
-                continue;
             }
 
-            // Stop if past end
-            if current_frame >= effective_end {
-                break;
+            flush_batch(&mut batch_refs, &mut batch_dists, &mut batch_frames)?;
+        } else {
+            let metric = metric.as_mut().unwrap();
+            // Streaming mode: decode and process frames on-the-fly
+            let mut current_frame = 0;
+            let mut processed = 0;
+
+            while let Some(ref_frame) = ref_reader.decode_next()? {
+                // Get corresponding distorted frame
+                let dist_frame = match dist_reader.decode_next()? {
+                    Some(f) => f,
+                    None => {
+                        log::warn!("Distorted video ended before reference");
+                        break;
+                    }
+                };
+
+                // Skip frames before start
+                if current_frame < cli.start_frame {
+                    current_frame += 1;
+                    continue;
+                }
+
+                // Stop if past end
+                if current_frame >= effective_end {
+                    break;
+                }
+
+                // Only process at step intervals
+                if (current_frame - cli.start_frame) % cli.frame_step == 0 {
+                    let frame_start = std::time::Instant::now();
+                    let score = match cli.input_format {
+                        InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
+                        InputFormat::F32 => {
+                            let ref_f32 = ImageData::from_rgba8(
+                                ref_frame.width,
+                                ref_frame.height,
+                                &ref_frame.data,
+                            );
+                            let dist_f32 = ImageData::from_rgba8(
+                                dist_frame.width,
+                                dist_frame.height,
+                                &dist_frame.data,
+                            );
+                            match (ref_f32, dist_f32) {
+                                (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
+                                (Err(err), _) | (_, Err(err)) => Err(err),
+                            }
+                        }
+                    }
+                    .context(format!("Failed to compute metric for frame {}", current_frame))?;
+                    let frame_time = frame_start.elapsed();
+
+                    scores.push(score);
+                    frame_numbers.push(current_frame);
+                    processed += 1;
+                    frames_since_update += 1;
+                    running_sum += score;
+                    last_score = score;
+                    last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                        let total_ns = frame_time.as_nanos() as f64;
+                        if total_ns > 0.0 {
+                            Some((ns as f64 / total_ns * 100.0).min(100.0))
+                        } else {
+                            None
+                        }
+                    });
+
+                    // Update progress every 100ms or every frame if slow
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                        let dt = now.duration_since(last_update).as_secs_f64();
+                        if dt > 0.0 {
+                            current_fps = frames_since_update as f64 / dt;
+                        }
+                        let avg_score = running_sum / processed as f64;
+                        print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                                       last_score, avg_score, last_gpu_usage);
+                        last_update = now;
+                        frames_since_update = 0;
+                    }
+                }
+
+                current_frame += 1;
+            }
+        }
+    } else if !use_inflight {
+        if use_batch {
+            let metric = batch_metric.as_mut().unwrap();
+            let mut processed = 0usize;
+            let mut batch_refs: Vec<ImageDataRgba8> = Vec::with_capacity(cli.batch_frames);
+            let mut batch_dists: Vec<ImageDataRgba8> = Vec::with_capacity(cli.batch_frames);
+            let mut batch_frames: Vec<usize> = Vec::with_capacity(cli.batch_frames);
+
+            let mut flush_batch = |batch_refs: &mut Vec<ImageDataRgba8>,
+                                   batch_dists: &mut Vec<ImageDataRgba8>,
+                                   batch_frames: &mut Vec<usize>| -> Result<()> {
+                if batch_refs.is_empty() {
+                    return Ok(());
+                }
+                let frame_start = std::time::Instant::now();
+                let scores_batch = metric
+                    .compute_batch_rgba8(batch_refs, batch_dists)
+                    .context("Failed to compute metric for batch")?;
+                let frame_time = frame_start.elapsed();
+
+                for (idx, score) in scores_batch.iter().enumerate() {
+                    let frame_num = batch_frames[idx];
+                    scores.push(*score);
+                    frame_numbers.push(frame_num);
+                    processed += 1;
+                    frames_since_update += 1;
+                    running_sum += *score;
+                    last_score = *score;
+                }
+
+                let per_frame_ns = frame_time.as_nanos() as f64 / scores_batch.len() as f64;
+                last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                    if per_frame_ns > 0.0 {
+                        Some((ns as f64 / per_frame_ns * 100.0).min(100.0))
+                    } else {
+                        None
+                    }
+                });
+
+                let now = std::time::Instant::now();
+                if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                    let dt = now.duration_since(last_update).as_secs_f64();
+                    if dt > 0.0 {
+                        current_fps = frames_since_update as f64 / dt;
+                    }
+                    let avg_score = running_sum / processed as f64;
+                    print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                                   last_score, avg_score, last_gpu_usage);
+                    last_update = now;
+                    frames_since_update = 0;
+                }
+
+                batch_refs.clear();
+                batch_dists.clear();
+                batch_frames.clear();
+
+                Ok(())
+            };
+
+            for frame_num in (cli.start_frame..effective_end).step_by(cli.frame_step) {
+                let ref_frame = ref_reader.read_frame(frame_num)
+                    .context(format!("Failed to read reference frame {}", frame_num))?;
+
+                let dist_frame = dist_reader.read_frame(frame_num)
+                    .context(format!("Failed to read distorted frame {}", frame_num))?;
+
+                batch_refs.push(ref_frame);
+                batch_dists.push(dist_frame);
+                batch_frames.push(frame_num);
+
+                if batch_refs.len() >= cli.batch_frames {
+                    flush_batch(&mut batch_refs, &mut batch_dists, &mut batch_frames)?;
+                }
             }
 
-            // Only process at step intervals
-            if (current_frame - cli.start_frame) % cli.frame_step == 0 {
+            flush_batch(&mut batch_refs, &mut batch_dists, &mut batch_frames)?;
+        } else {
+            let metric = metric.as_mut().unwrap();
+            // Cached mode: frames already loaded
+            for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
+                let ref_frame = ref_reader.read_frame(frame_num)
+                    .context(format!("Failed to read reference frame {}", frame_num))?;
+
+                let dist_frame = dist_reader.read_frame(frame_num)
+                    .context(format!("Failed to read distorted frame {}", frame_num))?;
+
                 let frame_start = std::time::Instant::now();
                 let score = match cli.input_format {
                     InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
@@ -422,12 +693,11 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                .context(format!("Failed to compute metric for frame {}", current_frame))?;
+                .context(format!("Failed to compute metric for frame {}", frame_num))?;
                 let frame_time = frame_start.elapsed();
 
                 scores.push(score);
-                frame_numbers.push(current_frame);
-                processed += 1;
+                frame_numbers.push(frame_num);
                 frames_since_update += 1;
                 running_sum += score;
                 last_score = score;
@@ -442,79 +712,17 @@ fn main() -> Result<()> {
 
                 // Update progress every 100ms or every frame if slow
                 let now = std::time::Instant::now();
-                if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
                     let dt = now.duration_since(last_update).as_secs_f64();
                     if dt > 0.0 {
                         current_fps = frames_since_update as f64 / dt;
                     }
-                    let avg_score = running_sum / processed as f64;
-                    print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                    let avg_score = running_sum / (i + 1) as f64;
+                    print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
                                    last_score, avg_score, last_gpu_usage);
                     last_update = now;
                     frames_since_update = 0;
                 }
-            }
-
-            current_frame += 1;
-        }
-    } else if !use_inflight {
-        // Cached mode: frames already loaded
-        for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
-            let ref_frame = ref_reader.read_frame(frame_num)
-                .context(format!("Failed to read reference frame {}", frame_num))?;
-
-            let dist_frame = dist_reader.read_frame(frame_num)
-                .context(format!("Failed to read distorted frame {}", frame_num))?;
-
-            let frame_start = std::time::Instant::now();
-            let score = match cli.input_format {
-                InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
-                InputFormat::F32 => {
-                    let ref_f32 = ImageData::from_rgba8(
-                        ref_frame.width,
-                        ref_frame.height,
-                        &ref_frame.data,
-                    );
-                    let dist_f32 = ImageData::from_rgba8(
-                        dist_frame.width,
-                        dist_frame.height,
-                        &dist_frame.data,
-                    );
-                    match (ref_f32, dist_f32) {
-                        (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
-                        (Err(err), _) | (_, Err(err)) => Err(err),
-                    }
-                }
-            }
-            .context(format!("Failed to compute metric for frame {}", frame_num))?;
-            let frame_time = frame_start.elapsed();
-
-            scores.push(score);
-            frame_numbers.push(frame_num);
-            frames_since_update += 1;
-            running_sum += score;
-            last_score = score;
-            last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
-                let total_ns = frame_time.as_nanos() as f64;
-                if total_ns > 0.0 {
-                    Some((ns as f64 / total_ns * 100.0).min(100.0))
-                } else {
-                    None
-                }
-            });
-
-            // Update progress every 100ms or every frame if slow
-            let now = std::time::Instant::now();
-            if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
-                let dt = now.duration_since(last_update).as_secs_f64();
-                if dt > 0.0 {
-                    current_fps = frames_since_update as f64 / dt;
-                }
-                let avg_score = running_sum / (i + 1) as f64;
-                print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
-                               last_score, avg_score, last_gpu_usage);
-                last_update = now;
-                frames_since_update = 0;
             }
         }
     } else {
@@ -696,62 +904,140 @@ fn main() -> Result<()> {
 
     #[cfg(not(feature = "ffmpeg"))]
     if !use_inflight {
-        for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
-            let ref_frame = ref_reader.read_frame(frame_num)
-                .context(format!("Failed to read reference frame {}", frame_num))?;
+        if use_batch {
+            let metric = batch_metric.as_mut().unwrap();
+            let mut processed = 0usize;
+            let mut batch_refs: Vec<ImageDataRgba8> = Vec::with_capacity(cli.batch_frames);
+            let mut batch_dists: Vec<ImageDataRgba8> = Vec::with_capacity(cli.batch_frames);
+            let mut batch_frames: Vec<usize> = Vec::with_capacity(cli.batch_frames);
 
-            let dist_frame = dist_reader.read_frame(frame_num)
-                .context(format!("Failed to read distorted frame {}", frame_num))?;
+            let mut flush_batch = |batch_refs: &mut Vec<ImageDataRgba8>,
+                                   batch_dists: &mut Vec<ImageDataRgba8>,
+                                   batch_frames: &mut Vec<usize>| -> Result<()> {
+                if batch_refs.is_empty() {
+                    return Ok(());
+                }
+                let frame_start = std::time::Instant::now();
+                let scores_batch = metric
+                    .compute_batch_rgba8(batch_refs, batch_dists)
+                    .context("Failed to compute metric for batch")?;
+                let frame_time = frame_start.elapsed();
 
-            let frame_start = std::time::Instant::now();
-            let score = match cli.input_format {
-                InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
-                InputFormat::F32 => {
-                    let ref_f32 = ImageData::from_rgba8(
-                        ref_frame.width,
-                        ref_frame.height,
-                        &ref_frame.data,
-                    );
-                    let dist_f32 = ImageData::from_rgba8(
-                        dist_frame.width,
-                        dist_frame.height,
-                        &dist_frame.data,
-                    );
-                    match (ref_f32, dist_f32) {
-                        (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
-                        (Err(err), _) | (_, Err(err)) => Err(err),
+                for (idx, score) in scores_batch.iter().enumerate() {
+                    let frame_num = batch_frames[idx];
+                    scores.push(*score);
+                    frame_numbers.push(frame_num);
+                    processed += 1;
+                    frames_since_update += 1;
+                    running_sum += *score;
+                    last_score = *score;
+                }
+
+                let per_frame_ns = frame_time.as_nanos() as f64 / scores_batch.len() as f64;
+                last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                    if per_frame_ns > 0.0 {
+                        Some((ns as f64 / per_frame_ns * 100.0).min(100.0))
+                    } else {
+                        None
                     }
+                });
+
+                let now = std::time::Instant::now();
+                if now.duration_since(last_update).as_millis() >= 100 || processed == 1 {
+                    let dt = now.duration_since(last_update).as_secs_f64();
+                    if dt > 0.0 {
+                        current_fps = frames_since_update as f64 / dt;
+                    }
+                    let avg_score = running_sum / processed as f64;
+                    print_progress(processed, total_frames, current_fps, now.duration_since(start_time),
+                                   last_score, avg_score, last_gpu_usage);
+                    last_update = now;
+                    frames_since_update = 0;
+                }
+
+                batch_refs.clear();
+                batch_dists.clear();
+                batch_frames.clear();
+
+                Ok(())
+            };
+
+            for frame_num in (cli.start_frame..effective_end).step_by(cli.frame_step) {
+                let ref_frame = ref_reader.read_frame(frame_num)
+                    .context(format!("Failed to read reference frame {}", frame_num))?;
+
+                let dist_frame = dist_reader.read_frame(frame_num)
+                    .context(format!("Failed to read distorted frame {}", frame_num))?;
+
+                batch_refs.push(ref_frame);
+                batch_dists.push(dist_frame);
+                batch_frames.push(frame_num);
+
+                if batch_refs.len() >= cli.batch_frames {
+                    flush_batch(&mut batch_refs, &mut batch_dists, &mut batch_frames)?;
                 }
             }
-            .context(format!("Failed to compute metric for frame {}", frame_num))?;
-            let frame_time = frame_start.elapsed();
 
-            scores.push(score);
-            frame_numbers.push(frame_num);
-            frames_since_update += 1;
-            running_sum += score;
-            last_score = score;
-            last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
-                let total_ns = frame_time.as_nanos() as f64;
-                if total_ns > 0.0 {
-                    Some((ns as f64 / total_ns * 100.0).min(100.0))
-                } else {
-                    None
-                }
-            });
+            flush_batch(&mut batch_refs, &mut batch_dists, &mut batch_frames)?;
+        } else {
+            let metric = metric.as_mut().unwrap();
+            for (i, frame_num) in (cli.start_frame..effective_end).step_by(cli.frame_step).enumerate() {
+                let ref_frame = ref_reader.read_frame(frame_num)
+                    .context(format!("Failed to read reference frame {}", frame_num))?;
 
-            // Update progress
-            let now = std::time::Instant::now();
-            if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
-                let dt = now.duration_since(last_update).as_secs_f64();
-                if dt > 0.0 {
-                    current_fps = frames_since_update as f64 / dt;
+                let dist_frame = dist_reader.read_frame(frame_num)
+                    .context(format!("Failed to read distorted frame {}", frame_num))?;
+
+                let frame_start = std::time::Instant::now();
+                let score = match cli.input_format {
+                    InputFormat::Rgba8 => metric.compute_rgba8(&ref_frame, &dist_frame),
+                    InputFormat::F32 => {
+                        let ref_f32 = ImageData::from_rgba8(
+                            ref_frame.width,
+                            ref_frame.height,
+                            &ref_frame.data,
+                        );
+                        let dist_f32 = ImageData::from_rgba8(
+                            dist_frame.width,
+                            dist_frame.height,
+                            &dist_frame.data,
+                        );
+                        match (ref_f32, dist_f32) {
+                            (Ok(ref_f32), Ok(dist_f32)) => metric.compute(&ref_f32, &dist_f32),
+                            (Err(err), _) | (_, Err(err)) => Err(err),
+                        }
+                    }
                 }
-                let avg_score = running_sum / (i + 1) as f64;
-                print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
-                               last_score, avg_score, last_gpu_usage);
-                last_update = now;
-                frames_since_update = 0;
+                .context(format!("Failed to compute metric for frame {}", frame_num))?;
+                let frame_time = frame_start.elapsed();
+
+                scores.push(score);
+                frame_numbers.push(frame_num);
+                frames_since_update += 1;
+                running_sum += score;
+                last_score = score;
+                last_gpu_usage = metric.gpu_time_ns().and_then(|ns| {
+                    let total_ns = frame_time.as_nanos() as f64;
+                    if total_ns > 0.0 {
+                        Some((ns as f64 / total_ns * 100.0).min(100.0))
+                    } else {
+                        None
+                    }
+                });
+
+                // Update progress
+                let now = std::time::Instant::now();
+                if now.duration_since(last_update).as_millis() >= 100 || i == 0 {
+                    let dt = now.duration_since(last_update).as_secs_f64();
+                    if dt > 0.0 {
+                        current_fps = frames_since_update as f64 / dt;
+                    }
+                    let avg_score = running_sum / (i + 1) as f64;
+                    print_progress(i + 1, total_frames, current_fps, now.duration_since(start_time),
+                                   last_score, avg_score, last_gpu_usage);
+                    last_update = now;
+                    frames_since_update = 0;
+                }
             }
         }
     } else {

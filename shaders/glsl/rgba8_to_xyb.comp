@@ -1,0 +1,62 @@
+#version 450
+
+// Convert packed RGBA8 bytes directly to XYB
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer InputRGBA {
+    uint rgba[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputX {
+    float x[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputY {
+    float y[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer OutputBOut {
+    float b_out[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+float gamma_correct(float v) {
+    if (v > 0.0) {
+        return pow(v, 1.0 / 3.0);
+    } else {
+        return -pow(-v, 1.0 / 3.0);
+    }
+}
+
+void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+
+    if (gx >= pc.width || gy >= pc.height) {
+        return;
+    }
+
+    uint idx = gy * pc.width + gx;
+    vec4 rgba_val = unpackUnorm4x8(rgba[idx]);
+
+    float r_val = rgba_val.r;
+    float g_val = rgba_val.g;
+    float b_val = rgba_val.b;
+
+    float mixed_r = 0.3 * r_val + 0.622 * g_val + 0.078 * b_val;
+    float mixed_g = 0.23 * r_val + 0.692 * g_val + 0.078 * b_val;
+    float mixed_b = 0.243 * r_val + 0.419 * g_val + 0.338 * b_val;
+
+    float l = gamma_correct(mixed_r);
+    float m = gamma_correct(mixed_g);
+    float s = gamma_correct(mixed_b);
+
+    x[idx] = 0.5 * (l - m);
+    y[idx] = 0.5 * (l + m);
+    b_out[idx] = s;
+}

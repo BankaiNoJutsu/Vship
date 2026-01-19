@@ -21,6 +21,7 @@ pub struct ComputeContext {
     last_gpu_time_ns: AtomicU64,
     timeline_semaphore: Option<vk::Semaphore>,
     timeline_value: AtomicU64,
+    staging_pool: std::sync::Mutex<Vec<AllocatedBuffer>>,
 }
 
 /// Batched command recorder for reducing submit/wait overhead
@@ -73,6 +74,7 @@ impl ComputeContext {
             last_gpu_time_ns: AtomicU64::new(0),
             timeline_semaphore,
             timeline_value: AtomicU64::new(0),
+            staging_pool: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -84,6 +86,23 @@ impl ComputeContext {
     /// Get allocator
     pub fn allocator(&self) -> &BufferAllocator {
         &self.allocator
+    }
+
+    fn acquire_staging_buffer(&self, size: u64) -> Result<AllocatedBuffer> {
+        let mut pool = self.staging_pool.lock().unwrap();
+        if let Some(idx) = pool.iter().position(|buf| buf.size() >= size) {
+            return Ok(pool.swap_remove(idx));
+        }
+        drop(pool);
+        self.allocator.create_staging_buffer(size)
+    }
+
+    fn reclaim_staging_buffers(&self, mut buffers: Vec<AllocatedBuffer>) {
+        if buffers.is_empty() {
+            return;
+        }
+        let mut pool = self.staging_pool.lock().unwrap();
+        pool.append(&mut buffers);
     }
 
     /// Begin recording commands
@@ -170,7 +189,7 @@ impl ComputeContext {
         dst: &AllocatedBuffer,
     ) -> Result<()> {
         let size = std::mem::size_of_val(data) as u64;
-        let mut staging = self.allocator.create_staging_buffer(size)?;
+        let mut staging = self.acquire_staging_buffer(size)?;
 
         // Write to staging buffer
         staging.write_data(data)?;
@@ -193,6 +212,7 @@ impl ComputeContext {
             Ok(())
         })?;
 
+        self.reclaim_staging_buffers(vec![staging]);
         Ok(())
     }
 
@@ -297,7 +317,7 @@ impl<'a> ComputeBatch<'a> {
         dst: &AllocatedBuffer,
     ) -> Result<()> {
         let size = std::mem::size_of_val(data) as u64;
-        let mut staging = self.ctx.allocator.create_staging_buffer(size)?;
+        let mut staging = self.ctx.acquire_staging_buffer(size)?;
         staging.write_data(data)?;
 
         unsafe {
@@ -341,6 +361,29 @@ impl<'a> ComputeBatch<'a> {
         Ok(readback)
     }
 
+    /// Record a buffer-to-buffer copy with offsets
+    pub fn record_copy_buffer(
+        &self,
+        src: &AllocatedBuffer,
+        dst: &AllocatedBuffer,
+        size: u64,
+        src_offset: u64,
+        dst_offset: u64,
+    ) {
+        unsafe {
+            let region = vk::BufferCopy::default()
+                .src_offset(src_offset)
+                .dst_offset(dst_offset)
+                .size(size);
+            self.ctx.device.device().cmd_copy_buffer(
+                self.cmd,
+                src.buffer(),
+                dst.buffer(),
+                &[region],
+            );
+        }
+    }
+
     /// Ensure transfer writes are visible to compute shaders
     pub fn record_transfer_to_compute_barrier(&self) {
         let barrier = vk::MemoryBarrier::default()
@@ -352,6 +395,25 @@ impl<'a> ComputeBatch<'a> {
                 self.cmd,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    /// Ensure transfer writes are visible to subsequent transfer reads
+    pub fn record_transfer_to_transfer_barrier(&self) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+
+        unsafe {
+            self.ctx.device.device().cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[barrier],
                 &[],
@@ -437,6 +499,7 @@ impl<'a> ComputeBatch<'a> {
         }
 
         self.ctx.last_gpu_time_ns.store(gpu_time_ns, Ordering::Relaxed);
+        self.ctx.reclaim_staging_buffers(self.staging_buffers);
         Ok(gpu_time_ns)
     }
 }

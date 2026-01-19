@@ -1,0 +1,98 @@
+#version 450
+
+// Vertical blur + SSIM error + tile-local reduction
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer RefBuffer {
+    float ref_data[];
+};
+
+layout(set = 0, binding = 1) readonly buffer DistBuffer {
+    float dist_data[];
+};
+
+layout(set = 0, binding = 2) readonly buffer RefHorizBuffer {
+    float ref_horiz[];
+};
+
+layout(set = 0, binding = 3) readonly buffer DistHorizBuffer {
+    float dist_horiz[];
+};
+
+layout(set = 0, binding = 4) readonly buffer KernelBuffer {
+    float kernel[];
+};
+
+layout(set = 0, binding = 5) writeonly buffer OutSums {
+    float sums[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint kernel_radius;
+} pc;
+
+shared float sdata[256];
+
+void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+    uint local_idx = gl_LocalInvocationIndex;
+
+    float error_val = 0.0;
+
+    if (gx < pc.width && gy < pc.height) {
+        uint idx = gy * pc.width + gx;
+
+        float mu_x = 0.0;
+        float mu_y = 0.0;
+        for (int k = -int(pc.kernel_radius); k <= int(pc.kernel_radius); ++k) {
+            int yy = int(gy) + k;
+            if (yy < 0) {
+                yy = 0;
+            } else if (yy >= int(pc.height)) {
+                yy = int(pc.height) - 1;
+            }
+            uint idx2 = uint(yy) * pc.width + gx;
+            float w = kernel[uint(k + int(pc.kernel_radius))];
+            mu_x += ref_horiz[idx2] * w;
+            mu_y += dist_horiz[idx2] * w;
+        }
+
+        float x = ref_data[idx];
+        float y = dist_data[idx];
+
+        float detail_x = x - mu_x;
+        float detail_y = y - mu_y;
+
+        float mean_diff = mu_x - mu_y;
+        float mean_error = mean_diff * mean_diff;
+
+        float detail_diff = detail_x - detail_y;
+        float detail_error = detail_diff * detail_diff;
+
+        float pixel_diff = x - y;
+        float pixel_error = pixel_diff * pixel_diff;
+
+        float error = 0.4 * mean_error + 0.3 * detail_error + 0.3 * pixel_error;
+        error_val = sqrt(error);
+    }
+
+    sdata[local_idx] = error_val;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (local_idx < stride) {
+            sdata[local_idx] += sdata[local_idx + stride];
+        }
+        barrier();
+    }
+
+    if (local_idx == 0) {
+        uint groups_x = (pc.width + 15u) / 16u;
+        uint group_idx = gl_WorkGroupID.y * groups_x + gl_WorkGroupID.x;
+        sums[group_idx] = sdata[0];
+    }
+}

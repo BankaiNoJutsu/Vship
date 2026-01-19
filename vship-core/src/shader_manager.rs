@@ -67,6 +67,8 @@ impl ShaderManager {
     /// Preload commonly used shaders
     pub fn preload_common_shaders(&mut self) -> Result<()> {
         let common_shaders = vec![
+            "gaussian_blur_error_reduce",
+            "rgba8_to_xyb",
             "rgba8_to_planar",
             "rgb_to_xyb",
             "gaussian_blur",

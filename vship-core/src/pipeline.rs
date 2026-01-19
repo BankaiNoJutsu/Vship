@@ -173,12 +173,12 @@ impl PipelineBuilder {
             .map(|binding| {
                 vk::DescriptorPoolSize::default()
                     .ty(binding.descriptor_type)
-                    .descriptor_count(256) // Support many descriptor sets per frame
+                    .descriptor_count(1024) // Support batched frames without pool resets
             })
             .collect::<Vec<_>>();
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(256)
+            .max_sets(1024)
             .pool_sizes(&pool_sizes)
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
 
